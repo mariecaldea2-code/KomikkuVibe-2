@@ -1,0 +1,221 @@
+package eu.kanade.translation.engines.runtime.onnx
+
+import ai.onnxruntime.OrtSession
+import logcat.LogPriority
+import tachiyomi.core.common.util.system.logcat
+import tachiyomi.domain.translation.PaddleOcrExecutionProvider
+
+internal val PaddleOcrExecutionProvider.wireLabel: String
+    get() = when (this) {
+        PaddleOcrExecutionProvider.CPU -> "cpu"
+        PaddleOcrExecutionProvider.QUALCOMM_QNN_GPU -> "qnn_gpu"
+        PaddleOcrExecutionProvider.QUALCOMM_QNN_HTP -> "qnn_htp"
+    }
+
+internal val HardwareDiscoveryEngine.HardwareRoute.wireLabel: String
+    get() = when (this) {
+        HardwareDiscoveryEngine.HardwareRoute.QUALCOMM_QNN_HTP -> "qnn_htp"
+        HardwareDiscoveryEngine.HardwareRoute.QUALCOMM_QNN_GPU -> "qnn_gpu"
+        HardwareDiscoveryEngine.HardwareRoute.NNAPI -> "nnapi"
+        HardwareDiscoveryEngine.HardwareRoute.CPU_XNNPACK -> "cpu"
+    }
+
+/**
+ * The resolved provider choice shared by the PaddleOCR v6 recognizer and its
+ * line detector. Resolution is done once per recognition-engine lifetime so
+ * the pair cannot accidentally benchmark different providers.
+ */
+data class PaddleOcrProviderResolution(
+    val requested: PaddleOcrExecutionProvider,
+    val route: HardwareDiscoveryEngine.HardwareRoute,
+    val fallbackReason: String? = null,
+) {
+    val requestedWireLabel: String
+        get() = requested.wireLabel
+
+    val resolvedRouteLabel: String
+        get() = route.wireLabel
+
+    val usedProbeFallback: Boolean
+        get() = fallbackReason != null
+
+    companion object {
+        fun cpu(): PaddleOcrProviderResolution = PaddleOcrProviderResolution(
+            requested = PaddleOcrExecutionProvider.CPU,
+            route = HardwareDiscoveryEngine.HardwareRoute.CPU_XNNPACK,
+        )
+    }
+}
+
+/**
+ * Explicit PaddleOCR-only provider policy.
+ *
+ * This factory deliberately bypasses [HardwareDiscoveryEngine.activeRoute] and
+ * [ModelRoutingEngine]. It probes the selected QNN backend, creates strict
+ * no-CPU-fallback accelerator options, and retries a failed accelerator session
+ * on a separately built CPU session. Every retry is labelled by the provider
+ * that actually opened the session, so a failed GPU/HTP attempt cannot be
+ * reported as an accelerator success.
+ */
+object PaddleOcrSessionFactory {
+
+    /**
+     * A strict QNN probe failure is device/runtime deterministic for this
+     * process. Keep its labelled CPU fallback so engine rebuilds do not retry
+     * the same failed native session probe.
+     */
+    private val probeFailureCache = mutableMapOf<PaddleOcrExecutionProvider, PaddleOcrProviderResolution>()
+
+    fun resolve(
+        requested: PaddleOcrExecutionProvider,
+    ): PaddleOcrProviderResolution {
+        if (requested == PaddleOcrExecutionProvider.CPU) {
+            logcat(LogPriority.INFO) {
+                "[paddle_provider] requested=cpu resolved=cpu probe=skipped"
+            }
+            return PaddleOcrProviderResolution.cpu()
+        }
+
+        return synchronized(probeFailureCache) {
+            probeFailureCache[requested]?.also { cached ->
+                logcat(LogPriority.WARN) {
+                    "[paddle_provider] requested=${requested.wireLabel} resolved=cpu " +
+                        "status=cached_probe_failure reason=${cached.fallbackReason}"
+                }
+            } ?: resolveUncached(requested).also { resolution ->
+                if (resolution.fallbackReason != null) {
+                    probeFailureCache[requested] = resolution
+                }
+            }
+        }
+    }
+
+    internal fun resetForTesting() {
+        synchronized(probeFailureCache) {
+            probeFailureCache.clear()
+        }
+    }
+
+    private fun resolveUncached(
+        requested: PaddleOcrExecutionProvider,
+    ): PaddleOcrProviderResolution {
+        val route = HardwareDiscoveryEngine.resolvePaddleOcrRoute(requested)
+        if (route == null) {
+            val reason = "${requested.wireLabel}_probe_failed"
+            logcat(LogPriority.WARN) {
+                "[paddle_provider] requested=${requested.wireLabel} resolved=cpu " +
+                    "status=unavailable reason=$reason"
+            }
+            return PaddleOcrProviderResolution(
+                requested = requested,
+                route = HardwareDiscoveryEngine.HardwareRoute.CPU_XNNPACK,
+                fallbackReason = reason,
+            )
+        }
+
+        logcat(LogPriority.INFO) {
+            "[paddle_provider] requested=${requested.wireLabel} resolved=${route.wireLabel} " +
+                "status=probe_ok"
+        }
+        return PaddleOcrProviderResolution(requested = requested, route = route)
+    }
+
+    /**
+     * Creates one PaddleOCR detector or recognizer session using the shared
+     * resolved choice. Accelerator options remain strict; CPU is only built as
+     * an explicit fallback after the accelerator probe/registration/session
+     * attempt fails.
+     */
+    internal fun <O, S> createSessionWithHonestLabel(
+        modelPath: String,
+        resolution: PaddleOcrProviderResolution,
+        buildRequested: (Boolean) -> OnnxRuntimeProvider.ProviderOptionsBuild<O>,
+        buildCpu: () -> OnnxRuntimeProvider.ProviderOptionsBuild<O>,
+        open: (O) -> S,
+        closeOptions: (O) -> Unit,
+        providerSink: (String) -> Unit = {},
+        recordModelFailure: (Throwable) -> Unit = {},
+    ): S {
+        val modelName = ModelRoutingEngine.resolveModelId(modelPath)
+        val acceleratorRoute = resolution.route.takeIf { it.isPaddleAccelerator() }
+        val canUseAccelerator = acceleratorRoute != null
+        if (resolution.fallbackReason != null) {
+            logcat(LogPriority.WARN) {
+                "[paddle_provider] model=$modelPath requested=${resolution.requestedWireLabel} " +
+                    "attempt=cpu reason=${resolution.fallbackReason}"
+            }
+        }
+
+        val useXnnpack = resolution.route == HardwareDiscoveryEngine.HardwareRoute.CPU_XNNPACK
+
+        return OnnxRuntimeProvider.openSessionWithHonestLabel(
+            route = resolution.route,
+            canUseAccelerator = canUseAccelerator,
+            useXnnpack = useXnnpack,
+            buildRequested = { buildRequested(canUseAccelerator) },
+            buildCpu = buildCpu,
+            open = open,
+            closeOptions = closeOptions,
+            sink = { registered ->
+                logcat(LogPriority.INFO) {
+                    "[paddle_provider] model=$modelPath requested=${resolution.requestedWireLabel} " +
+                        "resolved=${resolution.resolvedRouteLabel} registered=$registered " +
+                        "fallback=${resolution.fallbackReason ?: "none"}"
+                }
+                providerSink(registered)
+            },
+            recordModelFailure = { error ->
+                recordModelFailure(error)
+                logcat(LogPriority.WARN, error) {
+                    "[paddle_provider] model=$modelPath requested=${resolution.requestedWireLabel} " +
+                        "accelerator_session_failed; explicit_cpu_retry"
+                }
+            },
+            model = modelName,
+            isProbe = false,
+        )
+    }
+
+    /**
+     * Creates one PaddleOCR detector or recognizer session using the shared
+     * resolved choice. Accelerator options remain strict; CPU is only built as
+     * an explicit fallback after the accelerator probe/registration/session
+     * attempt fails.
+     */
+    fun createSession(
+        modelPath: String,
+        resolution: PaddleOcrProviderResolution,
+        configure: (OrtSession.SessionOptions) -> Unit = {},
+        providerSink: (String) -> Unit = {},
+    ): OrtSession {
+        val acceleratorRoute = resolution.route.takeIf { it.isPaddleAccelerator() }
+        val useXnnpack = resolution.route == HardwareDiscoveryEngine.HardwareRoute.CPU_XNNPACK
+        return createSessionWithHonestLabel(
+            modelPath = modelPath,
+            resolution = resolution,
+            buildRequested = { canUseAccelerator ->
+                OnnxRuntimeProvider.createSessionOptionsWithRegistration(
+                    useAccelerator = canUseAccelerator,
+                    useXnnpack = useXnnpack && !canUseAccelerator,
+                    routeOverride = acceleratorRoute,
+                    tripCircuitBreakerOnRegistrationFailure = false,
+                    configure = configure,
+                ).let { OnnxRuntimeProvider.ProviderOptionsBuild(it.options, it.registered) }
+            },
+            buildCpu = {
+                OnnxRuntimeProvider.createSessionOptionsWithRegistration(
+                    useAccelerator = false,
+                    useXnnpack = false,
+                    configure = configure,
+                ).let { OnnxRuntimeProvider.ProviderOptionsBuild(it.options, it.registered) }
+            },
+            open = { options -> OnnxRuntimeProvider.environment.createSession(modelPath, options) },
+            closeOptions = { options -> options.close() },
+            providerSink = providerSink,
+        )
+    }
+
+    private fun HardwareDiscoveryEngine.HardwareRoute.isPaddleAccelerator(): Boolean =
+        this == HardwareDiscoveryEngine.HardwareRoute.QUALCOMM_QNN_GPU ||
+            this == HardwareDiscoveryEngine.HardwareRoute.QUALCOMM_QNN_HTP
+}

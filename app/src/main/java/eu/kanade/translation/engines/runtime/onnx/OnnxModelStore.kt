@@ -1,0 +1,542 @@
+package eu.kanade.translation.engines.runtime.onnx
+
+import android.content.Context
+import eu.kanade.translation.engines.runtime.ModelDeployment
+import logcat.LogPriority
+import tachiyomi.core.common.util.system.logcat
+import java.io.File
+import java.io.FileOutputStream
+import java.io.InputStream
+
+data class ModelPaths(
+    val detectorModel: File,
+    val ocrEncoder: File,
+    val ocrDecoderInit: File,
+    val ocrDecoderStep: File,
+    val ocrVocab: File,
+    val inpaintModel: File?,
+    /** Fixed-shape AOT variant; kept optional until its corpus gate is passed. */
+    val inpaint512Model: File?,
+    /**
+     * optional YOLO26-nano manga panel detector model
+     * (`manga_panel_detector_int8.onnx`). Nullable because the panel detector
+     * is best-effort context — when absent or corrupt, panel assignment is
+     * skipped and translation proceeds panel-less. Copied from
+     * `models/detection/manga_panel_detector_int8.onnx` alongside the text
+     * detector; a failed copy leaves this null rather than throwing.
+     */
+    val panelDetectorModel: File?,
+    /**
+     * YOLO11-seg manga bubble segmenter model (`manga_bubble_segmenter_int8.onnx`).
+     */
+    val bubbleSegmenterModel: File?,
+)
+
+data class PaddleOcrV6LiteRtPaths(
+    val recognitionModelsByWidth: Map<Int, File>,
+    val dictionary: File,
+    val detectorModel: File,
+)
+
+data class PaddleOcrV6SmallPaths(
+    val recognitionModel: File,
+    val dictionary: File,
+)
+
+/**
+ * resolved paths for the PP-OCRv6 small **detection** (det) model.
+ * The det model runs inside each ROI crop from Stage-1 detection to find
+ * individual text lines (polygons), replacing the ink-gap column heuristic for
+ * the PaddleOCR rec path. See
+ * `docs/superpowers/specs/2026-06-23-paddleocr-v6-det-onnx-integration-design.md`.
+ */
+data class PaddleOcrV6DetPaths(
+    val detectionModel: File,
+)
+
+/**
+ * Deployed LiteRT fp32 vision models; each field is null when that asset is
+ * not bundled, so every engine keeps its ONNX session as the fallback.
+ */
+data class LiteRtVisionPaths(
+    val pageTextDetector: File?,
+    val panelDetector: File?,
+    val bubbleSegmenter: File?,
+    val ocrEncoder: File?,
+    val ocrDecoderInit: File?,
+    val ocrDecoderStep: File?,
+)
+
+/**
+ * fumetotranslate (Japanese→English on-device translator): int8 encoder +
+ * autoregressive decoder ONNX graphs and the two converted tokenizer tables.
+ */
+data class FumetoTranslatePaths(
+    val encoderModel: File,
+    val decoderModel: File,
+    val encoderVocab: File,
+    val spmPieces: File,
+)
+
+class OnnxModelStore(private val context: Context) {
+
+    /**
+     * Installed model files are hash-checked on their first cached deployment
+     * access by this store. Retain that result for unchanged file metadata so
+     * repeated warm accesses do not hash the full file again.
+     */
+    private val verifiedModelCacheEntries = mutableSetOf<VerifiedModelCacheEntry>()
+
+    private val modelsDir: File by lazy {
+        File(context.noBackupFilesDir, "tachiyomiat-models").also { dir ->
+            if (!dir.exists()) {
+                dir.mkdirs()
+                logcat(LogPriority.INFO) { "Created models directory: ${dir.absolutePath}" }
+            }
+        }
+    }
+
+    fun modelsAvailable(): Boolean {
+        val dir = modelsDir
+        return listOf(
+            "detector.onnx",
+            "encoder.onnx",
+            "decoder_init.onnx",
+            "decoder_step.onnx",
+            "vocab.txt",
+        ).all { File(dir, it).exists() }
+    }
+
+    fun assetsAvailable(): Boolean {
+        return modelsAvailable() ||
+            try {
+                context.assets.list("models/ocr")?.isNotEmpty() == true ||
+                    context.assets.list("models/detection")?.isNotEmpty() == true
+            } catch (_: Exception) {
+                false
+            }
+    }
+
+    suspend fun ensureModels(): ModelPaths {
+        val dir = modelsDir
+        val detectorFile = copyIfNeeded(dir, "detector.onnx", "models/detection/detector-v4-s_int8.onnx")
+        val encoderFile = copyIfNeeded(dir, "encoder.onnx", "models/ocr/encoder.onnx")
+        val decoderInitFile = copyIfNeeded(dir, "decoder_init.onnx", "models/ocr/decoder_init.onnx")
+        val decoderStepFile = copyIfNeeded(dir, "decoder_step.onnx", "models/ocr/decoder_step.onnx")
+        val vocabFile = copyIfNeeded(dir, "vocab.txt", "models/ocr/vocab.txt")
+
+        val inpaintFile = try {
+            copyIfNeeded(dir, "aot.onnx", "models/inpainting/aot.onnx")
+        } catch (_: Exception) {
+            logcat(LogPriority.WARN) { "Inpainting model not found in assets, skipping" }
+            null
+        }
+
+        val inpaint512File = try {
+            copyIfNeeded(dir, "aot-512.onnx", "models/inpainting/aot-512.onnx")
+        } catch (_: Exception) {
+            logcat(LogPriority.WARN) { "Fixed-512 inpainting model not found in assets, skipping" }
+            null
+        }
+
+        // Panel detector is best-effort context (mirrors inpaint copy): a missing
+        // asset or failed copy leaves it null so panel assignment is skipped, not crashed.
+        val panelDetectorFile = try {
+            copyIfNeeded(dir, "panel_detector.onnx", "models/detection/manga_panel_detector_int8.onnx")
+        } catch (_: Exception) {
+            logcat(LogPriority.WARN) { "Panel detector model not found in assets, skipping" }
+            null
+        }
+
+        val bubbleSegmenterFile = try {
+            copyIfNeeded(dir, "bubble_segmenter.onnx", "models/segmentation/manga109_bubble_int8.onnx")
+        } catch (_: Exception) {
+            logcat(LogPriority.WARN) { "Bubble segmenter model not found in assets, skipping" }
+            null
+        }
+
+        return ModelPaths(
+            detectorModel = detectorFile,
+            ocrEncoder = encoderFile,
+            ocrDecoderInit = decoderInitFile,
+            ocrDecoderStep = decoderStepFile,
+            ocrVocab = vocabFile,
+            inpaintModel = inpaintFile,
+            inpaint512Model = inpaint512File,
+            panelDetectorModel = panelDetectorFile,
+            bubbleSegmenterModel = bubbleSegmenterFile,
+        )
+    }
+
+    fun paddleOcrV6SmallAvailable(): Boolean {
+        val dir = File(modelsDir, "paddle-v6-small")
+        return listOf(
+            "inference.onnx",
+            "PP-OCRv6_small_rec.txt",
+        ).all { File(dir, it).exists() }
+    }
+
+    fun paddleOcrV6SmallAssetsAvailable(): Boolean {
+        val dir = File(modelsDir, "paddle-v6-small")
+        val onDisk = File(dir, "inference.onnx").exists() && File(dir, "PP-OCRv6_small_rec.txt").exists()
+        return onDisk ||
+            try {
+                context.assets.list("models/ocr/paddle-v6-small")?.isNotEmpty() == true
+            } catch (_: Exception) {
+                false
+            }
+    }
+
+    fun ensurePaddleOcrV6Small(): PaddleOcrV6SmallPaths {
+        val dir = File(modelsDir, "paddle-v6-small").also { if (!it.exists()) it.mkdirs() }
+        return PaddleOcrV6SmallPaths(
+            recognitionModel = copyIfNeeded(
+                dir,
+                "inference.onnx",
+                "models/ocr/paddle-v6-small/inference.onnx",
+            ),
+            dictionary = copyIfNeeded(
+                dir,
+                "PP-OCRv6_small_rec.txt",
+                "models/ocr/paddle-v6-small/PP-OCRv6_small_rec.txt",
+            ),
+        )
+    }
+
+    /**
+     * PP-OCRv6 small **detection** model availability.
+     *
+     * The det model is an optional refinement of the PaddleOCR rec path: when
+     * present it replaces the ink-gap vertical-column heuristic with a learned
+     * text-line detector. The pipeline must therefore tolerate its absence
+     * (graceful fallback) — [paddleOcrV6DetAvailable] / [assetsAvailable] gate
+     * whether the det engine is built.
+     */
+    fun paddleOcrV6LiteRtAssetsAvailable(): Boolean {
+        val dir = File(modelsDir, "paddle-v6-small/litert")
+        val onDisk = PADDLE_LITERT_WIDTHS.all { File(dir, "manga_rec_${it}_fp16.tflite").exists() } &&
+            File(dir, "PP-OCRv6_small_rec.txt").exists() &&
+            File(dir, "manga_det_960_fp16.tflite").exists()
+        return onDisk ||
+            try {
+                val files = context.assets.list(PADDLE_LITERT_ASSET_DIR)?.toSet() ?: return false
+                PADDLE_LITERT_REQUIRED_ASSETS.all { it in files }
+            } catch (_: Exception) {
+                false
+            }
+    }
+
+    fun ensurePaddleOcrV6LiteRt(): PaddleOcrV6LiteRtPaths {
+        val dir = File(modelsDir, "paddle-v6-small/litert").also { if (!it.exists()) it.mkdirs() }
+        val recognitionModels = PADDLE_LITERT_WIDTHS.associateWith { width ->
+            val name = "manga_rec_${width}_fp16.tflite"
+            copyIfNeeded(dir, name, "$PADDLE_LITERT_ASSET_DIR/$name")
+        }
+        val dictionaryName = "PP-OCRv6_small_rec.txt"
+        val detectorName = "manga_det_960_fp16.tflite"
+        return PaddleOcrV6LiteRtPaths(
+            recognitionModelsByWidth = recognitionModels,
+            dictionary = copyIfNeeded(
+                dir,
+                dictionaryName,
+                "$PADDLE_LITERT_ASSET_DIR/$dictionaryName",
+            ),
+            detectorModel = copyIfNeeded(
+                dir,
+                detectorName,
+                "$PADDLE_LITERT_ASSET_DIR/$detectorName",
+            ),
+        )
+    }
+
+    fun paddleOcrV6DetAvailable(): Boolean {
+        val dir = File(modelsDir, "paddle-v6-small/det")
+        return File(dir, "inference.onnx").exists()
+    }
+
+    fun paddleOcrV6DetAssetsAvailable(): Boolean {
+        return paddleOcrV6DetAvailable() ||
+            try {
+                context.assets.list("models/ocr/paddle-v6-small/det")?.isNotEmpty() == true
+            } catch (_: Exception) {
+                false
+            }
+    }
+
+    fun ensurePaddleOcrV6Det(): PaddleOcrV6DetPaths {
+        val dir = File(modelsDir, "paddle-v6-small/det").also { if (!it.exists()) it.mkdirs() }
+        return PaddleOcrV6DetPaths(
+            detectionModel = copyIfNeeded(
+                dir,
+                "inference.onnx",
+                "models/ocr/paddle-v6-small/det/inference.onnx",
+            ),
+        )
+    }
+
+    fun ensureMangaColorization(): File {
+        val dir = File(modelsDir, "coloring").also { if (!it.exists()) it.mkdirs() }
+        // int8 weights preferred: parity with fp32 on validation pages (PSNR
+        // 39+ dB) at a quarter of the size; fp32 stays bundled as the fallback
+        // while the int8 artifact is still being proven on-device.
+        val int8 = runCatching {
+            copyIfNeeded(dir, "manga_colorize_int8.onnx", "models/coloring/manga_colorize_int8.onnx")
+        }.getOrNull()
+        return int8 ?: copyIfNeeded(dir, "manga_colorize_fp32.onnx", "models/coloring/manga_colorize_fp32.onnx")
+    }
+
+    fun ensureMangaColorizationInt8(): File {
+        val dir = File(modelsDir, "coloring").also { if (!it.exists()) it.mkdirs() }
+        return copyIfNeeded(dir, "manga_colorize_int8.onnx", "models/coloring/manga_colorize_int8.onnx")
+    }
+
+    fun ffdnetDenoisingAvailable(): Boolean {
+        val dir = File(modelsDir, "coloring")
+        return File(dir, "ffdnet_fp16.onnx").exists()
+    }
+
+    fun ffdnetDenoisingAssetsAvailable(): Boolean {
+        return ffdnetDenoisingAvailable() ||
+            try {
+                context.assets.list("models/coloring")?.contains("ffdnet_fp16.onnx") == true
+            } catch (_: Exception) {
+                false
+            }
+    }
+
+    fun ensureFfdnetDenoising(): File {
+        val dir = File(modelsDir, "coloring").also { if (!it.exists()) it.mkdirs() }
+        return copyIfNeeded(dir, "ffdnet_fp16.onnx", "models/coloring/ffdnet_fp16.onnx")
+    }
+
+    fun liteRtVisionAssetsAvailable(): Boolean {
+        val dir = File(modelsDir, "litert-vision")
+        val onDisk = File(dir, "detector_v4_s_fp32.tflite").exists()
+        return onDisk ||
+            try {
+                context.assets.list("models/detection/litert")?.isNotEmpty() == true ||
+                    context.assets.list("models/segmentation/litert")?.isNotEmpty() == true ||
+                    context.assets.list("models/ocr/litert")?.isNotEmpty() == true
+            } catch (_: Exception) {
+                false
+            }
+    }
+
+    /** Per-file optional: a missing asset leaves that engine on its ONNX path. */
+    fun ensureLiteRtVision(): LiteRtVisionPaths {
+        val dir = File(modelsDir, "litert-vision").also { if (!it.exists()) it.mkdirs() }
+        fun copy(assetPath: String): File? = try {
+            copyIfNeeded(dir, assetPath.substringAfterLast('/'), assetPath)
+        } catch (_: Exception) {
+            logcat(LogPriority.INFO) { "LiteRT vision asset $assetPath not bundled; ONNX stays authoritative" }
+            null
+        }
+        return LiteRtVisionPaths(
+            pageTextDetector = copy("models/detection/litert/detector_v4_s_fp32.tflite"),
+            panelDetector = copy("models/detection/litert/panel_detector_fp32.tflite"),
+            bubbleSegmenter = copy("models/segmentation/litert/bubble_segmenter_fp32.tflite"),
+            ocrEncoder = copy("models/ocr/litert/ocr_encoder_fp32.tflite"),
+            ocrDecoderInit = copy("models/ocr/litert/ocr_decoder_init_fp32.tflite"),
+            ocrDecoderStep = copy("models/ocr/litert/ocr_decoder_step_fp32.tflite"),
+        )
+    }
+
+    fun fumetoAssetsAvailable(): Boolean {
+        val dir = File(modelsDir, "fumeto")
+        val onDisk = listOf("encoder.int8.onnx", "decoder.int8.onnx", "enc-vocab.tsv", "spm-pieces.txt")
+            .all { File(dir, it).exists() }
+        return onDisk ||
+            try {
+                context.assets.list("models/fumeto")?.isNotEmpty() == true
+            } catch (_: Exception) {
+                false
+            }
+    }
+
+    fun ensureFumetoTranslate(): FumetoTranslatePaths {
+        val dir = File(modelsDir, "fumeto").also { if (!it.exists()) it.mkdirs() }
+        return FumetoTranslatePaths(
+            encoderModel = copyIfNeeded(dir, "encoder.int8.onnx", "models/fumeto/encoder.int8.onnx"),
+            decoderModel = copyIfNeeded(dir, "decoder.int8.onnx", "models/fumeto/decoder.int8.onnx"),
+            encoderVocab = copyIfNeeded(dir, "enc-vocab.tsv", "models/fumeto/enc-vocab.tsv"),
+            spmPieces = copyIfNeeded(dir, "spm-pieces.txt", "models/fumeto/spm-pieces.txt"),
+        )
+    }
+
+    private fun copyIfNeeded(dir: File, name: String, assetPath: String): File {
+        val dest = File(dir, name)
+        val stampFile = File(dir, "$name.version")
+        // Fast path: cached file exists and its recorded stamp matches the
+        // version marker + asset path prefix. Do not hash the bundled asset
+        // here. Cached bytes are compared with the digest in their recorded
+        // stamp once per unchanged cache entry.
+        val expectedPrefix = "$MODEL_ASSET_VERSION:$assetPath:"
+        if (dest.exists() && dest.length() > 0) {
+            val cachedStamp = ModelDeployment.readStamp(stampFile)
+            val matchingStamp = cachedStamp?.takeIf { it.startsWith(expectedPrefix) }
+            if (matchingStamp != null) {
+                if (name.endsWith(".onnx") && !looksLikeValidOnnx(dest)) {
+                    // Cached copy is structurally invalid (truncated/corrupt).
+                    // A bad .onnx previously passed the old 0x08 check and
+                    // produced garbage all-gray inpaint or an opaque
+                    // OrtException; delete to re-copy.
+                    logcat(LogPriority.WARN) {
+                        "Cached $name failed ONNX integrity check (size=${dest.length()}); re-copying from assets"
+                    }
+                    if (!dest.delete()) {
+                        logcat(LogPriority.WARN) { "Could not delete corrupt cached $name; attempting overwrite" }
+                    }
+                } else {
+                    val verificationKey = VerifiedModelCacheEntry(
+                        path = dest.absolutePath,
+                        stamp = matchingStamp,
+                        length = dest.length(),
+                        lastModified = dest.lastModified(),
+                    )
+                    if (verificationKey in verifiedModelCacheEntries ||
+                        ModelDeployment.cachedFileMatchesStamp(dest, matchingStamp)
+                    ) {
+                        verifiedModelCacheEntries += verificationKey
+                        return dest
+                    }
+                    logcat(LogPriority.WARN) {
+                        "Cached $name failed content-hash integrity check (size=${dest.length()}); re-copying from assets"
+                    }
+                    verifiedModelCacheEntries.removeAll { it.path == dest.absolutePath }
+                    if (!dest.delete()) {
+                        logcat(LogPriority.WARN) { "Could not delete corrupt cached $name; attempting overwrite" }
+                    }
+                }
+            } else {
+                val assetPresent = try {
+                    context.assets.open(assetPath).use { }
+                    true
+                } catch (_: Exception) {
+                    false
+                }
+                if (!assetPresent) {
+                    logcat(LogPriority.WARN) {
+                        "Asset $assetPath not in APK; preserving existing cached $name (${dest.length()} bytes)"
+                    }
+                    return dest
+                }
+                logcat(LogPriority.INFO) {
+                    "Cached $name has a stale or missing asset stamp; replacing bundled model copy"
+                }
+                if (!dest.delete()) {
+                    logcat(LogPriority.WARN) { "Could not delete stale cached $name; attempting overwrite" }
+                }
+                stampFile.delete()
+            }
+        }
+
+        logcat(LogPriority.INFO) { "Copying model from assets: $assetPath -> ${dest.absolutePath}" }
+        var inputStream: InputStream? = null
+        var outputStream: FileOutputStream? = null
+        try {
+            inputStream = context.assets.open(assetPath)
+            outputStream = FileOutputStream(dest)
+            val buffer = ByteArray(8192)
+            var bytesRead: Int
+            while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                outputStream.write(buffer, 0, bytesRead)
+            }
+            outputStream.flush()
+            // Compute the bundled asset's stamp now that it needs deploying.
+            // Its hash lets the cached-file fast path validate installed bytes
+            // without re-reading the bundled asset.
+            val expectedStamp = computeExpectedStamp(assetPath)
+            if (!ModelDeployment.writeStamp(stampFile, expectedStamp)) {
+                logcat(LogPriority.WARN) {
+                    "Copied $assetPath but could not write its cache stamp"
+                }
+            }
+            logcat(LogPriority.INFO) { "Copied $assetPath (${dest.length()} bytes)" }
+        } catch (e: Exception) {
+            logcat(LogPriority.ERROR, e) { "Failed to copy $assetPath" }
+            throw e
+        } finally {
+            inputStream?.close()
+            outputStream?.close()
+        }
+        return dest
+    }
+
+    /**
+     * Computes the deployment stamp for [assetPath] from the bundled asset
+     * stream. Called only when deploying (not on the fast path), so the cost of
+     * hashing the full asset is paid once per actual re-copy, not per app start.
+     */
+    private fun computeExpectedStamp(assetPath: String): String {
+        return context.assets.open(assetPath).use { stream ->
+            ModelDeployment.computeStamp(MODEL_ASSET_VERSION, assetPath, stream)
+        }
+    }
+
+    /**
+     * lightweight structural validity check for a cached .onnx,
+     * replacing the old single-byte `0x08` heuristic which any truncated file
+     * could pass. A corrupt/garbage model that passes the old check either
+     * throws an opaque OrtException at session creation (surfaces as a generic
+     * "Inpainting failed") or, worse, loads a session that emits near-zero
+     * output → uniform 128-gray inpaint. Catching it here forces a clean
+     * re-copy from assets instead.
+     *
+     * Verifies, without a protobuf parser:
+     *  1. Size floor: a real ONNX model for this app is multi-MB. A file below
+     *     [MIN_VALID_ONNX_BYTES] is certainly truncated/empty. (The AOT model
+     *     is ~23MB; this floor is deliberately permissive for future smaller
+     *     models while still rejecting garbage.)
+     *  2. Protobuf header shape: an onnx ModelProto's first field is
+     *     `ir_version` (field 1, varint), so byte 0 is 0x08 and byte 1 is a
+     *     single-byte varint ir_version (1..15 → high bit clear). Field 7
+     *     (`producer_name`, length-delimited, tag 0x3a) commonly follows.
+     *  3. Magic NOT matching: reject files that are clearly something else
+     *     (PNG `89 50 4E 47`, ZIP/PK `50 4B`, gzip `1F 8B`).
+     *
+     * Returns true only if all cheap checks pass; a true validation is the
+     * downstream OrtSession creation (in [NeuralInpaintingCoordinator.initialize]).
+     */
+    private fun looksLikeValidOnnx(file: File): Boolean {
+        if (file.length() < MIN_VALID_ONNX_BYTES) return false
+        val header = ByteArray(2)
+        val read = try {
+            file.inputStream().use { it.read(header) }
+        } catch (e: Exception) {
+            logcat(LogPriority.WARN) { "Could not read ${file.name} header: ${e.message}" }
+            return false
+        }
+        if (read < 2) return false
+        // Field 1 (ir_version), varint wire type → tag 0x08.
+        if (header[0] != 0x08.toByte()) return false
+        // ir_version is a single-byte varint (values 1..15 have the high bit
+        // clear; current ONNX ir_version is 8). A high-bit-set first varint byte
+        // with no continuation is not a valid ModelProto opener.
+        if (header[1].toInt() and 0x80 != 0) return false
+        return true
+    }
+
+    private data class VerifiedModelCacheEntry(
+        val path: String,
+        val stamp: String,
+        val length: Long,
+        val lastModified: Long,
+    )
+
+    private companion object {
+        const val PADDLE_LITERT_ASSET_DIR = "models/ocr/paddle-v6-small/litert"
+        val PADDLE_LITERT_WIDTHS = listOf(160, 320, 480, 640, 1600)
+        val PADDLE_LITERT_REQUIRED_ASSETS = PADDLE_LITERT_WIDTHS.map { "manga_rec_${it}_fp16.tflite" } +
+            listOf("manga_det_960_fp16.tflite", "PP-OCRv6_small_rec.txt")
+
+        // Bundled-model generation label. Bump when shipping a new model
+        // generation; the per-asset SHA-256 in ModelDeployment.computeStamp
+        // already auto-detects byte-level changes to a cached file. This label
+        // exists so a forced re-deploy can ship WITHOUT a byte change (e.g.
+        // fixing a corrupt bundle whose hash happens to match an older cache).
+        const val MODEL_ASSET_VERSION = "ppocrv6-manga-v0.2-fp16-2026-10-04"
+
+        // Real models are multi-MB (AOT ~23MB); below 64 KiB is certainly truncated.
+        const val MIN_VALID_ONNX_BYTES = 64L * 1024L
+    }
+}

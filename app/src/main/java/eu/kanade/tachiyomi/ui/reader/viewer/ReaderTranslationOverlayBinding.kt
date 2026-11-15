@@ -1,0 +1,43 @@
+package eu.kanade.tachiyomi.ui.reader.viewer
+
+import eu.kanade.translation.model.PageTranslationView
+import eu.kanade.translation.model.TranslationBlockView
+import eu.kanade.translation.model.toPageDisplayProjection
+
+data class ReaderTranslationOverlayBinding(
+    val blocks: List<TranslationBlockView>,
+    val pageWidth: Int,
+    val pageHeight: Int,
+)
+
+/**
+ * Selects the overlay independently from image loading. The cleaned bitmap and
+ * translated text are separate reader layers, so every image decode must be
+ * able to reconstruct this binding without waiting for another store emission.
+ */
+fun selectReaderTranslationOverlayBinding(
+    showTranslatedImage: Boolean,
+    translation: PageTranslationView?,
+): ReaderTranslationOverlayBinding {
+    if (translation == null) {
+        return ReaderTranslationOverlayBinding(emptyList(), 0, 0)
+    }
+    val width = when {
+        translation.imgWidth > 0f -> translation.imgWidth.toInt()
+        translation.originalImgWidth > 0f -> translation.originalImgWidth.toInt()
+        else -> 0
+    }
+    val height = when {
+        translation.imgHeight > 0f -> translation.imgHeight.toInt()
+        translation.originalImgHeight > 0f -> translation.originalImgHeight.toInt()
+        else -> 0
+    }
+    if (showTranslatedImage && translation.toPageDisplayProjection().displayReady) {
+        return ReaderTranslationOverlayBinding(
+            blocks = translation.blocks,
+            pageWidth = width,
+            pageHeight = height,
+        )
+    }
+    return ReaderTranslationOverlayBinding(emptyList(), 0, 0)
+}

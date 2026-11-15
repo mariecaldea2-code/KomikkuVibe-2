@@ -1,0 +1,50 @@
+package eu.kanade.translation.engines.inpainting
+
+import tachiyomi.domain.translation.NeuralInpaintModel
+
+enum class InpaintingMode {
+    FAST,
+    BALANCE,
+    QUALITY,
+    ;
+
+    /** True when this mode asks the recognition engine to initialize the selected neural model's LiteRT session. */
+    val initializesNeuralSessions: Boolean
+        get() = this != FAST
+
+    companion object {
+        const val DEGRADED_SUFFIX = "_DEGRADED"
+
+        /** Unknown and legacy values map to FAST so stale prefs never select a mode that can hard-fail. */
+        fun fromPref(value: String?): InpaintingMode = when (value) {
+            "BALANCE" -> BALANCE
+            "QUALITY" -> QUALITY
+            "FAST" -> FAST
+            else -> FAST
+        }
+    }
+}
+
+/** Neural modes with unavailable sessions are stamped as degraded for honest persistence. */
+fun InpaintingMode.stampName(neuralAvailable: Boolean): String =
+    if (initializesNeuralSessions && !neuralAvailable) name + InpaintingMode.DEGRADED_SUFFIX else name
+
+/** Persists the selected neural route while preserving FAST's classical-only stamp. */
+fun InpaintingMode.stampName(
+    neuralModel: NeuralInpaintModel,
+    neuralAvailable: Boolean,
+    degraded: Boolean = false,
+): String {
+    if (this == InpaintingMode.FAST) {
+        return if (degraded) name + InpaintingMode.DEGRADED_SUFFIX else name
+    }
+    val modelTag = when (neuralModel) {
+        NeuralInpaintModel.LAMA_LITERT_GPU -> "LAMA_LITERT"
+        // Optimized AOT (FP16 TFLite via the shared LiteRT GPU runtime) — a
+        // NEW token so legacy ONNX-AOT "AOT" cache stamps no longer match and
+        // those pages re-inpaint under the optimized model.
+        NeuralInpaintModel.AOT_GAN -> "AOT_LITERT"
+    }
+    val degradedTag = if (degraded || !neuralAvailable) InpaintingMode.DEGRADED_SUFFIX else ""
+    return "$name:$modelTag$degradedTag"
+}

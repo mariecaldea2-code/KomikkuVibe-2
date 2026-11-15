@@ -1,0 +1,292 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <string name="pref_category_translations">Translations</string>
+    <string name="pref_translation_summary">Automatic Translations</string>
+    <string name="manga_translate">Translate</string>
+    <string name="manga_colorize">Colorize</string>
+    <string name="manga_colorize_unavailable">Enable &quot;Colorize pages&quot; in translation settings first</string>
+    <string name="reader_colorize_chapter">Colorize chapter</string>
+    <string name="reader_colorize_summary">Color this chapter\'s pages without translating — works on streamed chapters</string>
+    <string name="reader_colorize_page">Colorize page</string>
+    <string name="reader_colorize_page_summary">Color the current page without translating — works while reading online</string>
+    <string name="reader_colorize_page_started">Colorizing this page…</string>
+    <string name="reader_colorize_page_failed">Couldn\'t colorize this page</string>
+    <string name="reader_colorize_conflict_translation">A translation job is already queued or running for this chapter</string>
+    <string name="reader_colorize_page_busy">A translation is already running on this page — colorize will stay off until it finishes</string>
+    <string name="reader_colorize_queued">Colorization queued for this chapter</string>
+    <string name="reader_colorize_queue_failed">Couldn\'t queue colorization for this chapter</string>
+    <string name="translation_reset_chapter">Reset Chapter</string>
+    <string name="translation_reset_chapter_summary">Deletes all OCR data, cleaned images and translations for this chapter. Manual edits are removed.</string>
+    <string name="manga_translation_progress">Translation progress</string>
+    <string name="manga_translation_no_progress">Waiting for the chapter queue to start</string>
+    <string name="error_mlkit_language_unsupported">MLKit doesn't support this language</string>
+    <string name="pref_show_translations">Show Translations</string>
+    <string name="pref_show_translations_summary">Display rendered translated text on pages</string>
+    <string name="pref_group_setup">Translation Setup</string>
+    <string name="pref_translate_from">Translate From</string>
+    <string name="pref_ocr_model">OCR model</string>
+    <string name="pref_translate_to">Translate To</string>
+    <string name="pref_group_engine">Translator</string>
+    <string name="pref_sub_engine_api_key">Your Secret Key</string>
+    <string name="pref_engine_model">LLM Model</string>
+    <string name="pref_engine_temperature">LLM Temperature</string>
+    <string name="pref_engine_max_output">LLM Max Output Token Count</string>
+    <string name="pref_gemini_thinking_mode">Gemini reasoning</string>
+    <string name="pref_gemini_thinking_disabled">Disabled</string>
+    <string name="pref_gemini_thinking_auto">Automatic</string>
+    <string name="pref_gemini_thinking_low">Low</string>
+
+    <!-- Translation engine refactor: two-family architecture -->
+    <string name="pref_translation_type">Translator type</string>
+    <string name="pref_translation_type_standard">Standard translator</string>
+    <string name="pref_translation_type_ai">AI model translator</string>
+    <string name="pref_standard_engine">Standard engine</string>
+    <string name="pref_deepl_api_key">DeepL API key</string>
+    <string name="pref_ai_provider">AI provider</string>
+    <string name="pref_ai_api_key_gemini">Gemini API key</string>
+    <string name="pref_ai_api_key_openrouter">OpenRouter API key</string>
+    <string name="pref_ai_api_key_deepseek">DeepSeek API key</string>
+    <string name="pref_ai_base_url_lmstudio">LM Studio base URL</string>
+    <string name="pref_ai_key_set">Your key is set (not shown)</string>
+    <string name="pref_ai_key_not_set">Not set</string>
+    <string name="pref_ai_no_key">Enter an API key to fetch models</string>
+    <string name="pref_ai_no_base_url">Enter a base URL to fetch models</string>
+    <string name="pref_inpainting_mode">Inpainting mode</string>
+    <string name="pref_inpainting_mode_quality">Quality</string>
+    <string name="pref_inpainting_mode_fast">Fast</string>
+    <string name="pref_inpainting_mode_balance">Balance</string>
+    <string name="pref_inpainting_mode_lama_gpu">Manga LaMa (LiteRT GPU FP16)</string>
+    <string name="pref_inpainting_neural_model">Neural inpainting model</string>
+    <string name="pref_inpainting_neural_model_aot_gan">AOT-GAN (LiteRT GPU FP16)</string>
+    <string name="pref_colorization_title">Colorization</string>
+    <string name="pref_colorization_enabled">Colorize pages</string>
+    <string name="pref_colorization_enabled_summary">Run on-device coloring after inpainting (slower pass)</string>
+    <string name="pref_auto_colorize">Auto-colorize pages (N, N+1)</string>
+    <string name="pref_auto_colorize_summary">Color visible and upcoming pages automatically without downloading the chapter</string>
+    <string name="pref_colorization_model">Colorization model</string>
+    <string name="pref_colorization_model_mcv2_npu_w8a8">Manga Colorization v2 (SM8650 NPU W8A8 — 576×832, cross-series calibrated, experimental; fails without fallback)</string>
+    <string name="pref_colorization_model_manga_light_hybrid">Manga Light (SAM NPU + GPU, 512×512 experimental)</string>
+    <string name="pref_ffdnet_denoising">FFDNet pre-denoise (original recipe colors, slower)</string>
+    <string name="pref_ffdnet_denoising_summary">Runs FFDNet at native resolution before resizing for exact palette reproduction; disables fast screentone bilateral filtering</string>
+    <string name="pref_upscaling_title">Upscaling</string>
+    <string name="pref_upscaling_enabled">QuickSRNetLarge upscaling</string>
+    <string name="pref_upscaling_enabled_summary">Experimental — ×4 upscaling of a single ≤128×128 region on NPU (SM8650)</string>
+    <string name="pref_upscaling_unsupported_summary">Model not provisioned yet; enabling has no effect until the upscaling engine ships</string>
+    <string name="reader_translate">Translate</string>
+    <string name="reader_translation_stop_all">Stop all translation</string>
+    <string name="reader_batch_switch_title">Batch translation is active</string>
+    <string name="reader_batch_switch_message">Pause batch translation and switch to reader translation?</string>
+    <string name="reader_batch_switch_confirm">Pause and switch</string>
+    <string name="reader_batch_switch_cancel">Keep batch running</string>
+    <string name="reader_batch_switch_cancelled">Reader translation was not started; batch translation is still active</string>
+    <string name="reader_batch_switch_wait">Batch translation is still winding down; reader translation will wait</string>
+    <string name="reader_batch_switch_reader_active">Reader translation is already active</string>
+
+    <!-- TachiyomiAT: confirmed retranslation of an already-processed page from the reader -->
+    <string name="reader_page_retranslate_title">Retranslate this page?</string>
+    <string name="reader_page_retranslate_message">The existing translation and its processing data will be deleted. This page will then be processed again using your current translation settings. This cannot be undone.</string>
+    <string name="reader_page_retranslate_action">Retranslate</string>
+    <string name="reader_page_retranslate_confirm">Retranslate</string>
+    <string name="reader_page_retranslate_reset_failed">Could not clear the previous translation data; retranslation was not started</string>
+
+    <!-- TachiyomiAT: floating affordance that returns a zoomed page to its normal scale -->
+    <string name="reader_zoom_reset">Reset zoom</string>
+
+    <!-- TachiyomiAT: live queue view shown in the reader translation settings sheet -->
+
+    <!-- TachiyomiAT: live reader auto-translation feedback -->
+
+    <!-- TachiyomiAT: per-page original/translated compare handle -->
+    <string name="reader_compare_handle">Compare original and translated</string>
+    <string name="reader_compare_show_original">Show original</string>
+    <string name="reader_compare_show_translated">Show translated</string>
+    <string name="reader_compare_open_settings">Translation settings</string>
+
+    <!-- Reader overlay translation settings sheet -->
+    <string name="translation_settings">Translation</string>
+    <string name="pref_translation_enabled">Enable translation</string>
+    <string name="pref_auto_translate">Auto-translate pages</string>
+    <string name="pref_auto_translate_summary">Translates the current page and pre-processes upcoming pages automatically</string>
+
+    <!-- TachiyomiAT: floating translation status pill (active-page stage). -->
+    <string name="reader_translation_pill_queued">Queued</string>
+    <string name="reader_translation_pill_preparing">Preparing…</string>
+    <string name="reader_translation_pill_reading">Reading text…</string>
+    <string name="reader_translation_pill_translating">Translating…</string>
+    <string name="reader_translation_pill_cleaning">Cleaning…</string>
+    <string name="reader_translation_pill_coloring">Coloring…</string>
+    <string name="reader_translation_pill_finishing">Finishing…</string>
+    <string name="reader_translation_pill_ready">Ready</string>
+    <string name="reader_translation_pill_textless">No text found</string>
+    <string name="reader_translation_pill_cancelled">Cancelled</string>
+    <string name="reader_translation_pill_failed">Failed</string>
+
+    <!-- TachiyomiAT: translate button presentation (adaptive is the default mode). -->
+    <string name="pref_reader_translate_button_mode">Show translate button only with controls</string>
+    <string name="pref_reader_translate_button_mode_summary_default">Default: dim the translate button while reading; fully reveal it when controls are shown</string>
+    <string name="pref_reader_translate_button_mode_summary_with_controls">The translate button is hidden while reading and appears only with reader controls</string>
+
+    <!-- TachiyomiAT: pre-translation confirmation popup (manga screen batch action) -->
+    <string name="translation_confirm_dont_show">Don\'t show this again</string>
+    <string name="pref_confirm_pretranslate">Confirm before batch translation</string>
+    <string name="pref_confirm_pretranslate_summary">Show a settings review popup before translating a chapter from the manga screen</string>
+
+    <!-- TachiyomiAT: redesigned batch progress sheet (§12 layout) -->
+    <!-- TachiyomiAT bug 2 fix: split the old single Render row. Color is
+         text-fill color estimation (renderStatus == READY); Display is
+         hasRenderedResult, the reader's actual translated-image gate. -->
+    <string name="manga_batch_aborted">Batch aborted: %1$s</string>
+    <string name="manga_batch_retry">Retry translation</string>
+    <string name="manga_batch_first_pass">Translating and rendering pages: %1$d/%2$d</string>
+    <string name="manga_batch_finalizing">Finishing translation updates</string>
+    <string name="manga_batch_page_progress">Page %1$d of %2$d</string>
+    <string name="manga_batch_stage_done">done</string>
+    <string name="manga_batch_stage_failed">failed</string>
+    <string name="manga_batch_stage_queued">queued</string>
+    <!-- TachiyomiAT: tier-led progress chips. Each page chip carries two
+         stage blocks; Ready is the committed reader display projection, while
+         Processed includes terminal failures and textless pages. -->
+    <string name="manga_batch_tier_readable">Ready</string>
+    <string name="manga_batch_tier_failed">Failed</string>
+    <string name="manga_batch_read_now">Read now</string>
+
+    <string name="manga_translate_download_first">Translate (will download first)</string>
+    <string name="manga_translation_details">Translation details</string>
+    <string name="manga_translation_cancel">Cancel translation</string>
+    <string name="manga_chapter_reset_data">Reset data</string>
+    <string name="manga_translate_multi">Translate</string>
+    <!-- TachiyomiAT bug 3: another chapter of the same source is actively
+         translating when the user starts a new batch; confirm before cancelling. -->
+    <string name="manga_translate_conflict_title">Translation in progress</string>
+    <string name="manga_translate_conflict_body">Chapter \"%1$s\" is still translating. Cancel it and start this chapter?</string>
+    <string name="manga_translate_conflict_confirm">Cancel and start</string>
+    <!-- TachiyomiAT bug 4: toast + snackbar strings for translation cancellation. -->
+    <string name="translation_cancelled_toast">Translation cancelled</string>
+    <string name="auto_translation_disabled_toast">Auto translation disabled</string>
+    <string name="batch_cancelled_toast">Batch translation cancelled</string>
+    <string name="translation_cancelled_undo">Undo</string>
+    <string name="manga_batch_stage_ocr_name">Detection &amp; OCR</string>
+    <string name="manga_batch_stage_ai_name">AI Translation</string>
+    <string name="manga_batch_stage_inpaint_name">Bubble Cleaning</string>
+    <string name="manga_batch_stage_coloring_name">Coloring</string>
+    <string name="manga_batch_stage_render_name">Text Overlay</string>
+    <string name="manga_batch_status_paused">Paused</string>
+    <!-- Phase-aware drawer hero. Shown instead of a
+         numeric 0% / 0/0 while no real translation page total exists yet. -->
+    <string name="manga_batch_download_wifi_warning">Download waiting for Wi-Fi</string>
+    <string name="translation_resume_paused_hint">Translation is still paused; retry when the provider cooldown expires</string>
+    <string name="manga_batch_phase_download_failed">Download failed</string>
+    <string name="manga_batch_phase_queued">Queued for translation</string>
+    <string name="manga_batch_phase_completed">Completed</string>
+    <!-- Explicit terminal download-side states and the
+         admission-failure state that must never read as a download failure. -->
+    <string name="manga_batch_phase_cancelled">Translation cancelled</string>
+    <!-- Partial download: available pages are real, the
+         source total is unknown, and the drawer must never show a percentage. -->
+    <!-- Phase-truth copy for resume rebuild/restore, derived in
+         TranslationUiTruth and shared by the progress sheet and the reader
+         bottom bar, so neither surface freezes on stale "Batch X/Y" copy. -->
+    <string name="translation_status_rebuilding">Rebuilding pipeline…</string>
+    <string name="translation_bar_restoring">Restoring %1$d pages…</string>
+
+    <!-- Reader UX modernization prototype: floating navigation chrome -->
+    <string name="reader_quick_actions">More actions</string>
+    <string name="reader_dock_page_of_pages">%1$d / %2$d</string>
+    <string name="reader_chapter_nav_previous">Previous chapter</string>
+    <string name="reader_chapter_nav_next">Next chapter</string>
+
+    <!-- Reader settings sheet sections -->
+    <string name="reader_settings_title">Reader settings</string>
+    <string name="reader_section_display_adjustment">Display adjustment</string>
+
+    <!-- Destructive data management rows (moved from the compare handle dialog) -->
+    <string name="reader_data_reset_confirm_title">Reset translation data?</string>
+    <string name="reader_data_reset_confirm_message">%1$s will be regenerated the next time this page is translated. This cannot be undone.</string>
+    <string name="reader_data_reset_keep_edits">Reset translation output (keep edits)</string>
+    <string name="action_reset">Reset</string>
+    <string name="action_reset_chapter_data">Reset Chapter Data</string>
+    <string name="reader_translation_reset_chapter_summary">Deletes all translation, OCR and colorization data for this chapter</string>
+    <string name="reader_delete_chapter_confirm_title">Reset chapter translation data?</string>
+    <string name="reader_delete_chapter_confirm_message">All derived data for this chapter will be deleted:\n• Translation store manifest and backups\n• Per-page snapshots and processing artifacts\n• Cleaned, colorized and rendered images\n• Cached reader display streams\n\nAny translation or colorization running for this chapter will be cancelled. Original pages and downloads are kept.\n\nThis cannot be undone.</string>
+    <string name="reader_chapter_reset_complete">Chapter data reset: %1$d files and %2$d folders removed</string>
+    <string name="reader_chapter_reset_failed">Chapter reset incomplete: some files could not be deleted</string>
+    <string name="reader_tab_translation">Translation</string>
+    <string name="reader_tab_display">Display</string>
+    <string name="reader_tab_data">Data</string>
+
+    <!-- Translator floater preferences -->
+    <string name="pref_floater_show">Show translator floater</string>
+    <string name="pref_floater_idle_fade">Fade floater while inactive</string>
+    <string name="pref_floater_idle_fade_summary">Dims and tucks toward the edge after a few idle seconds</string>
+    <string name="pref_floater_reset_position">Reset floater position</string>
+    <string name="pref_floater_reset_position_summary">Docks the floater back to the left edge, vertically centered</string>
+
+    <!-- Auto-translate quick toggle on the floater menu -->
+    <string name="reader_floater_auto_translate">Auto-translate</string>
+
+    <!-- Sheet redesign: reader drawer -->
+    <string name="reader_sheet_subtitle">Reading mode &amp; display</string>
+    <string name="reader_section_navigation_feel">Navigation &amp; feel</string>
+    <string name="reader_mode_manga">Manga</string>
+    <string name="reader_mode_manga_summary">Paged · left to right</string>
+    <string name="reader_mode_webtoon">Webtoon</string>
+    <string name="reader_mode_webtoon_summary">Long strip</string>
+    <string name="reader_custom_brightness_summary">Override system brightness while reading</string>
+    <string name="reader_brightness_level">Brightness level</string>
+
+    <!-- Sheet redesign: translation drawer -->
+    <string name="reader_translation_sheet_title">Translation</string>
+    <string name="reader_translation_sheet_subtitle">Live translation &amp; vision pipeline</string>
+    <string name="reader_translation_section_activation">Activation</string>
+    <string name="reader_translation_section_overlay">Overlay &amp; controls</string>
+    <string name="reader_translation_section_vision">Vision</string>
+    <string name="reader_translation_section_inpainting">Inpainting</string>
+    <string name="reader_translation_section_reset">Reset</string>
+    <string name="pref_translation_enabled_summary">Translate button &amp; compare floater on pages</string>
+    <string name="reader_translation_engine_standard">Standard</string>
+    <string name="reader_translation_engine_ai">AI powered</string>
+    <string name="reader_translation_floater_summary">Hold the handle to peek at the original page</string>
+    <string name="reader_translation_ocr_paddle_summary">Fast on-device</string>
+    <string name="reader_translation_ocr_mangaocr_summary">High-accuracy Japanese</string>
+    <string name="reader_translation_ocr_mlkit_summary">Universal Latin/CJK</string>
+    <string name="reader_translation_deepl_api_key">DeepL API key</string>
+    <string name="reader_translation_engine_fumeto_summary">On-device Japanese→English model (CPU, page context)</string>
+
+    <!-- Translation settings shared section headings -->
+    <string name="translation_section_languages">Languages</string>
+    <string name="translation_section_translator">Translator</string>
+    <string name="translation_section_advanced">Advanced settings</string>
+
+    <!-- Batch pre-configuration -->
+    <string name="batch_translate_chapters">Translate chapters</string>
+    <string name="batch_start_cta">Start batch (%1$d)</string>
+
+    <!-- Neural inpainting preflight -->
+    <string name="translation_inpaint_model_missing_title">Inpainting model missing</string>
+    <string name="translation_inpaint_model_missing_message">%1$s inpainting needs the %2$s model, which is not included in this build. Fast inpainting works without any model.</string>
+    <string name="translation_inpaint_switch_fast">Switch to Fast &amp; continue</string>
+    <string name="reader_inpaint_model_missing_toast">%1$s inpainting needs the %2$s model, which is not in this build. Switch inpainting to Fast in settings.</string>
+    <string name="reader_auto_inpaint_model_missing_toast">Auto-translation needs an inpainting model missing from this build. Switch inpainting to Fast in settings.</string>
+    <string name="translation_inpaint_failed_toast">Inpainting failed (%1$s) — translations are shown on the original image</string>
+
+    <!-- Batch progress sheet (focus & details) -->
+    <string name="batch_translation_title">Batch translation</string>
+    <string name="batch_tab_focus">Focus</string>
+    <string name="batch_tab_details">Details</string>
+    <string name="batch_section_queue">Queue</string>
+    <string name="batch_section_pipeline">Pipeline</string>
+    <string name="batch_section_pages">Pages</string>
+    <string name="batch_queue_done">Done</string>
+    <string name="batch_queue_queued">Queued</string>
+    <string name="batch_queue_retry">Retry</string>
+    <string name="batch_stat_elapsed">Elapsed</string>
+    <string name="batch_stat_remaining">Remaining</string>
+    <string name="batch_stat_speed">Speed</string>
+    <string name="batch_speed_pages_per_min">%1$.1f pages/min</string>
+    <string name="batch_live_status">Live status</string>
+    <string name="batch_live_current_step">Current step</string>
+    <string name="batch_live_time_elapsed">Time elapsed</string>
+    <string name="batch_live_estimated_remaining">Estimated remaining</string>
+    <string name="batch_live_processing_speed">Processing speed</string>
+</resources>

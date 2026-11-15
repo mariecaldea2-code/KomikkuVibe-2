@@ -1,0 +1,510 @@
+package eu.kanade.translation.processing
+
+import com.hippo.unifile.UniFile
+import eu.kanade.translation.coordinator.BatchTranslationCoordinator
+import eu.kanade.translation.engines.translator.TextTranslator
+import eu.kanade.translation.engines.vision.ocr.PageRecognitionEngine
+import eu.kanade.translation.model.PageTranslation
+import eu.kanade.translation.model.StageStatus
+import eu.kanade.translation.model.detachedCopy
+import eu.kanade.translation.model.isColorizeOnlyComplete
+import eu.kanade.translation.model.isTextlessTerminal
+import eu.kanade.translation.model.toDraft
+import eu.kanade.translation.persistence.ChapterTranslationStore
+import eu.kanade.translation.persistence.PageWriteOrigin
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+import logcat.LogPriority
+import tachiyomi.core.common.util.system.logcat
+import java.io.InputStream
+
+/**
+ * Ordered batch translation coordinator for full chapter execution.
+ *
+ * Architecture:
+ * 1. Ordered source inventory -> pre-register totals in [ChapterTranslationStore].
+ * 2. Durable progress rebuilding: scans existing valid committed page bundles and skips them.
+ * 3. Full-chapter OCR barrier: detects and recognizes text across all remaining pages first.
+ * 4. Bounded 2-task concurrency: translation chunk loop and sequential inpainting loop overlap.
+ * 5. Fail-closed resume safety: errors or cancellation never wipe committed bundles on disk.
+ */
+internal class BatchPageOperation(
+    private val processor: TranslationProcessor,
+    private val recognitionEngineProvider: () -> PageRecognitionEngine,
+    private val translatorProvider: () -> TextTranslator,
+    private val prepareEngines: suspend () -> Unit = {},
+) {
+
+    data class Progress(
+        val chapterKey: String,
+        val completedPages: Int,
+        val totalPages: Int,
+        val currentStage: String,
+        val isFinished: Boolean = false,
+        val error: String? = null,
+    ) {
+        val fraction: Float get() = if (totalPages > 0) completedPages.toFloat() / totalPages else 0f
+    }
+
+    /**
+     * Runs the page stages for one admitted chapter. Queue admission, active-run state, and the
+     * progress flow remain owned by [BatchTranslationCoordinator].
+     */
+    suspend fun execute(
+        chapterKey: String,
+        orderedPageKeys: List<String>,
+        streamProvider: (String) -> InputStream,
+        store: ChapterTranslationStore,
+        progress: MutableStateFlow<Progress>,
+        companionDir: UniFile? = null,
+        inpaintingEnabled: Boolean = true,
+        chunkSize: Int = 5,
+        onProgress: ((Progress) -> Unit)? = null,
+        colorizeOnly: Boolean = false,
+        prepareStream: (suspend (String) -> Unit)? = null,
+    ): Progress = if (colorizeOnly) {
+        executeColorizeOnly(
+            chapterKey = chapterKey,
+            orderedPageKeys = orderedPageKeys,
+            streamProvider = streamProvider,
+            store = store,
+            companionDir = companionDir,
+            progress = progress,
+            onProgress = onProgress,
+            prepareStream = prepareStream,
+        )
+    } else {
+        executeBatch(
+            chapterKey = chapterKey,
+            orderedPageKeys = orderedPageKeys,
+            streamProvider = streamProvider,
+            store = store,
+            companionDir = companionDir,
+            inpaintingEnabled = inpaintingEnabled,
+            chunkSize = chunkSize,
+            progress = progress,
+            onProgress = onProgress,
+        )
+    }
+
+    /**
+     * Colorize-only pass: decode each original page and colorize it directly —
+     * no OCR barrier, no translation, no inpaint, no translator/OCR engine
+     * preparation (colorization inits lazily). Pages already carrying real OCR
+     * data are never clobbered; colorized-from-original pages are the resume
+     * scan's completed set. [prepareStream] is awaited before each decode so a
+     * streamed chapter's page can be fetched from its source on demand.
+     *
+     * A per-page colorization failure (decode, engine, upscale, commit) is
+     * isolated: the page is durably marked FAILED with [PageTranslation.coloringError]
+     * and the run continues, because each page's colorization is independent
+     * work. The chapter then completes as READY_WITH_WARNINGS (see
+     * [BatchProgressReconciler.reconcileFlaggedCompleted]) and the failed pages
+     * retry on the next colorize run. Only RUN-LEVEL failures — the colorization
+     * runtime being unavailable, or a streamed page that cannot be fetched from
+     * the source (transient, affects every remaining page) — end the run early.
+     */
+    private suspend fun executeColorizeOnly(
+        chapterKey: String,
+        orderedPageKeys: List<String>,
+        streamProvider: (String) -> InputStream,
+        store: ChapterTranslationStore,
+        companionDir: UniFile?,
+        progress: MutableStateFlow<Progress>,
+        onProgress: ((Progress) -> Unit)?,
+        prepareStream: (suspend (String) -> Unit)? = null,
+    ): Progress {
+        val totalCount = orderedPageKeys.size
+        val currentState = store.state.value
+
+        val completedKeys = orderedPageKeys.filter { key ->
+            val page = currentState[key]
+            // OCR-READY pages keep their real data (never clobbered). Coloring
+            // reuse is NOT asserted here: identity-unverified coloring is
+            // re-verified against the fresh decode fingerprint in the loop.
+            page?.ocrStatus == StageStatus.READY
+        }.toSet()
+
+        var completedCount = completedKeys.size
+        var failedCount = 0
+        publish(progress, Progress(chapterKey, completedCount, totalCount, "RESUME_CHECK"), onProgress)
+        logcat(LogPriority.INFO) {
+            "BatchColorizeOnly: chapter $chapterKey has $completedCount/$totalCount pages already complete"
+        }
+
+        val remainingKeys = orderedPageKeys.filter { it !in completedKeys }
+        if (remainingKeys.isEmpty()) {
+            val finalProgress = Progress(chapterKey, totalCount, totalCount, "COMPLETED", isFinished = true)
+            publish(progress, finalProgress, onProgress)
+            return finalProgress
+        }
+
+        // First call builds the colorization runtime; absence (missing assets or
+        // a failed session) is a chapter-level failure, not a per-page skip.
+        val coloringEngine = processor.activeColorizationEngine()
+        if (coloringEngine == null) {
+            val err = "Colorization is disabled or its model is unavailable"
+            logcat(LogPriority.ERROR) { "BatchColorizeOnly: $err for chapter $chapterKey" }
+            val failProgress = Progress(chapterKey, completedCount, totalCount, "FAILED", isFinished = true, error = err)
+            publish(progress, failProgress, onProgress)
+            return failProgress
+        }
+
+        for (pageKey in remainingKeys) {
+            try {
+                prepareStream?.invoke(pageKey)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                val err = "Failed to fetch page image for $pageKey during colorize pass: ${t.message}"
+                logcat(LogPriority.ERROR) { "BatchColorizeOnly: $err" }
+                store.updatePageFromCurrentSnapshot(pageKey, "batch:colorize-fetch-failed") { current ->
+                    (current ?: PageTranslation(sourceFileName = pageKey)).apply {
+                        ocrStatus = StageStatus.SKIPPED
+                        translationStatus = StageStatus.SKIPPED
+                        inpaintStatus = StageStatus.SKIPPED
+                        coloringStatus = StageStatus.FAILED
+                        coloringError = err
+                    }
+                }
+                val failProgress = Progress(chapterKey, completedCount, totalCount, "FAILED", isFinished = true, error = err)
+                publish(progress, failProgress, onProgress)
+                return failProgress
+            }
+            val decoded = processor.decodeImage(pageKey, { streamProvider(pageKey) }) { recognitionEngineProvider() }
+            if (decoded == null) {
+                val err = "Failed to decode page image for $pageKey during colorize pass"
+                logcat(LogPriority.ERROR) { "BatchColorizeOnly: $err" }
+                store.updatePageFromCurrentSnapshot(pageKey, "batch:colorize-decode-failed") { current ->
+                    (current ?: PageTranslation(sourceFileName = pageKey)).apply {
+                        ocrStatus = StageStatus.SKIPPED
+                        translationStatus = StageStatus.SKIPPED
+                        inpaintStatus = StageStatus.SKIPPED
+                        coloringStatus = StageStatus.FAILED
+                        coloringError = err
+                    }
+                }
+                // Isolated page failure: the decode is page-local (corrupt or
+                // oversized image), so remaining pages still get colored.
+                failedCount++
+                publish(progress, Progress(chapterKey, completedCount, totalCount, "COLORING"), onProgress)
+                continue
+            }
+            // Reuse only identity-verified coloring: the stored fingerprint
+            // must match the bytes just decoded; otherwise recolor.
+            val prior = store.state.value[pageKey]
+            if (
+                prior?.isColorizeOnlyComplete == true &&
+                prior.sourceFingerprint != null &&
+                prior.sourceFingerprint == decoded.sourceFingerprint
+            ) {
+                processor.releaseDecoded(decoded)
+                completedCount++
+                publish(progress, Progress(chapterKey, completedCount, totalCount, "COLORING"), onProgress)
+                continue
+            }
+            val page = try {
+                // Live indicator: holders and the batch tracker see the page
+                // mid-run instead of only the final commit.
+                store.markColorizeRunning(pageKey, "batch:colorize-running")
+                PageTranslation(sourceFileName = pageKey).apply {
+                    imgWidth = decoded.bitmap.width.toFloat()
+                    imgHeight = decoded.bitmap.height.toFloat()
+                    originalImgWidth = decoded.originalWidth.toFloat()
+                    originalImgHeight = decoded.originalHeight.toFloat()
+                    decodeSampleSize = decoded.sampleSize
+                    sourceFingerprint = decoded.sourceFingerprint
+                    ocrStatus = StageStatus.SKIPPED
+                    translationStatus = StageStatus.SKIPPED
+                    inpaintStatus = StageStatus.SKIPPED
+                    originalImageFallback = true
+                    updatedAt = System.currentTimeMillis()
+                    val upscaler = processor.activeUpscalingEngine()
+                    processor.colorize(
+                        pageKey = pageKey,
+                        page = this,
+                        coloringEngine = coloringEngine,
+                        companionDir = if (upscaler != null) null else companionDir,
+                        base = decoded.bitmap,
+                        fromOriginal = true,
+                    )
+                    if (upscaler != null && coloringStatus == StageStatus.READY) {
+                        try {
+                            processor.upscale(pageKey, this, upscaler, companionDir)
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                            throw cancelled
+                        } catch (t: Throwable) {
+                            coloringStatus = StageStatus.FAILED
+                            coloringError = t.message ?: "Upscaling failed"
+                        }
+                    }
+                }
+            } finally {
+                processor.releaseDecoded(decoded)
+            }
+
+            val commit = try {
+                processor.handOffColoredBitmapForDisplay(page)
+                store.updatePageFromCurrentSnapshot(pageKey, "batch:colorize-commit") { page }
+            } finally {
+                processor.releasePageBitmaps(page)
+            }
+            if (commit is ChapterTranslationStore.PatchResult.Rejected || page.coloringStatus != StageStatus.READY) {
+                val error = if (commit is ChapterTranslationStore.PatchResult.Rejected) {
+                    "Failed to save colorized page $pageKey: ${commit.reason}"
+                } else {
+                    "Failed to colorize page $pageKey: ${page.coloringError ?: "no colorized image was produced"}"
+                }
+                logcat(LogPriority.ERROR) { "BatchColorizeOnly: $error" }
+                // Isolated page failure: the page's durable state carries
+                // coloringError (or the superseded RUNNING marker heals via
+                // the stranded-page sweep). Keep coloring the rest.
+                failedCount++
+                publish(progress, Progress(chapterKey, completedCount, totalCount, "COLORING"), onProgress)
+                continue
+            }
+            completedCount++
+            publish(
+                progress,
+                Progress(chapterKey, completedCount, totalCount, "COLORING"),
+                onProgress,
+            )
+        }
+
+        // The terminal chapter status (TRANSLATED vs READY_WITH_WARNINGS vs
+        // retryable ERROR) is derived from the store by the coordinator's
+        // reconciler; a warning-free run and a run with isolated failures both
+        // finish here instead of aborting the queue entry.
+        val finalProgress = Progress(chapterKey, completedCount + failedCount, totalCount, "COMPLETED", isFinished = true)
+        publish(progress, finalProgress, onProgress)
+        return finalProgress
+    }
+
+    private suspend fun executeBatch(
+        chapterKey: String,
+        orderedPageKeys: List<String>,
+        streamProvider: (String) -> InputStream,
+        store: ChapterTranslationStore,
+        companionDir: UniFile?,
+        inpaintingEnabled: Boolean,
+        chunkSize: Int,
+        progress: MutableStateFlow<Progress>,
+        onProgress: ((Progress) -> Unit)?,
+    ): Progress {
+        val totalCount = orderedPageKeys.size
+        val currentState = store.state.value
+
+        // 1. Resume scan: identify already-completed pages from durable store
+        val completedKeys = orderedPageKeys.filter { key ->
+            val page = currentState[key]
+            page?.translationStatus == StageStatus.READY || page?.isTextlessTerminal == true
+        }.toSet()
+
+        var completedCount = completedKeys.size
+        publish(progress, Progress(chapterKey, completedCount, totalCount, "RESUME_CHECK"), onProgress)
+        logcat(LogPriority.INFO) {
+            "BatchTranslationCoordinator: chapter $chapterKey has $completedCount/$totalCount pages already completed"
+        }
+
+        val remainingKeys = orderedPageKeys.filter { it !in completedKeys }
+        if (remainingKeys.isEmpty()) {
+            val finalProgress = Progress(chapterKey, totalCount, totalCount, "COMPLETED", isFinished = true)
+            publish(progress, finalProgress, onProgress)
+            return finalProgress
+        }
+
+        prepareEngines()
+        val recognitionEngine = recognitionEngineProvider()
+        val translator = translatorProvider()
+
+        // 2. Full-Chapter OCR Barrier
+        publish(progress, Progress(chapterKey, completedCount, totalCount, "OCR_BARRIER"), onProgress)
+        val analyzedPages = LinkedHashMap<String, PageTranslation>()
+
+        for (pageKey in remainingKeys) {
+            val existing = store.state.value[pageKey]
+            if (existing != null && existing.ocrStatus == StageStatus.READY && existing.blocks.isNotEmpty()) {
+                // Reuse existing OCR blocks from store
+                analyzedPages[pageKey] = existing.toDraft()
+            } else {
+                val decoded = processor.decodeImage(pageKey, { streamProvider(pageKey) }) { recognitionEngine }
+                if (decoded == null) {
+                    val err = "Failed to decode page image for $pageKey during OCR pass"
+                    logcat(LogPriority.ERROR) { err }
+                    store.updatePageFromCurrentSnapshot(pageKey, "batch:decode-failed") { current ->
+                        (current ?: PageTranslation(sourceFileName = pageKey)).apply {
+                            ocrStatus = StageStatus.FAILED
+                            translationStatus = StageStatus.FAILED
+                            inpaintStatus = StageStatus.FAILED
+                            errorMessage = err
+                        }
+                    }
+                    val failProgress = Progress(chapterKey, completedCount, totalCount, "FAILED", isFinished = true, error = err)
+                    publish(progress, failProgress, onProgress)
+                    return failProgress
+                }
+
+                val page = try {
+                    processor.analyze(pageKey, decoded.bitmap, recognitionEngine).apply {
+                        sourceFingerprint = decoded.sourceFingerprint
+                    }
+                } finally {
+                    processor.releaseDecoded(decoded)
+                }
+                analyzedPages[pageKey] = page
+                // Judged BEFORE the OCR commit replaces the store entry: a
+                // prior colorize-only result is valid only with matching
+                // source identity.
+                val priorColoredFingerprint = store.state.value[pageKey]
+                    ?.takeIf { it.isColorizeOnlyComplete && it.sourceFingerprint != null }
+                    ?.sourceFingerprint
+
+                // Commit OCR state
+                store.updatePageFromCurrentSnapshot(pageKey, "batch:ocr") { page }
+
+                // Textless pages are complete immediately!
+                if (page.blocks.isEmpty() || page.isTextlessTerminal) {
+                    // A no-text page still colorizes its original when
+                    // colorization is on and no identity-verified colored
+                    // result exists — no detector is forced for it.
+                    if (processor.activeColorizationEngine() != null &&
+                        priorColoredFingerprint != page.sourceFingerprint
+                    ) {
+                        processor.colorizeOriginalPage(
+                            pageKey = pageKey,
+                            streamFn = { streamProvider(pageKey) },
+                            store = store,
+                            companionDir = companionDir,
+                            origin = PageWriteOrigin.BATCH,
+                        )
+                    }
+                    completedCount++
+                    publish(progress, Progress(chapterKey, completedCount, totalCount, "OCR_BARRIER"), onProgress)
+                }
+            }
+        }
+
+        // Filter pages needing translation and inpaint
+        val pagesNeedingWork = analyzedPages.filterValues { it.blocks.isNotEmpty() && !it.isTextlessTerminal }
+        if (pagesNeedingWork.isEmpty()) {
+            val finalProgress = Progress(chapterKey, totalCount, totalCount, "COMPLETED", isFinished = true)
+            publish(progress, finalProgress, onProgress)
+            return finalProgress
+        }
+
+        // 3. Bounded 2-Task Concurrency: Translation loop + Sequential Inpainting loop
+        publish(progress, Progress(chapterKey, completedCount, totalCount, "TRANSLATING_AND_INPAINTING"), onProgress)
+        val inpaintChannel = Channel<PageTranslation>(capacity = 2)
+
+        coroutineScope {
+            // Task 1: Translation loop (chunks of up to chunkSize)
+            val translationTask = launch(Dispatchers.Default) {
+                val entries = pagesNeedingWork.entries.toList()
+                for (chunk in entries.chunked(chunkSize)) {
+                    val chunkMap = chunk.associate { it.key to it.value.detachedCopy() }.toMutableMap()
+                    processor.translateBatch(chunkMap, translator)
+
+                    for ((pageKey, translatedPage) in chunkMap) {
+                        store.updatePageFromCurrentSnapshot(pageKey, "batch:translate") { translatedPage }
+                        inpaintChannel.send(translatedPage)
+                    }
+                }
+                inpaintChannel.close()
+            }
+
+            // Task 2: Inpainting loop (bounded sequential processing)
+            val inpaintingTask = launch(Dispatchers.Default) {
+                for (translatedPage in inpaintChannel) {
+                    val pageKey = checkNotNull(translatedPage.sourceFileName)
+
+                    if (inpaintingEnabled) {
+                        val decoded = processor.decodeImage(pageKey, { streamProvider(pageKey) }) { recognitionEngine }
+                        if (decoded != null) {
+                            try {
+                                processor.inpaint(pageKey, decoded.bitmap, translatedPage, recognitionEngine, companionDir)
+                            } finally {
+                                processor.releaseDecoded(decoded)
+                            }
+                        } else {
+                            translatedPage.inpaintStatus = StageStatus.READY
+                            translatedPage.originalImageFallback = true
+                        }
+                    } else {
+                        translatedPage.inpaintStatus = StageStatus.READY
+                        translatedPage.originalImageFallback = true
+                    }
+
+                    // Colorization is a derived post-inpaint stage that never
+                    // re-fails the page (colorize owns that contract).
+                    val coloringEngine = processor.activeColorizationEngine()
+                    val upscaler = processor.activeUpscalingEngine()
+                    if (coloringEngine != null && translatedPage.cleanedBitmap != null) {
+                        processor.colorize(
+                            pageKey = pageKey,
+                            page = translatedPage,
+                            coloringEngine = coloringEngine,
+                            companionDir = if (upscaler != null) null else companionDir,
+                        )
+                    } else if (coloringEngine != null) {
+                        translatedPage.coloringStatus = StageStatus.SKIPPED
+                    }
+
+                    if (upscaler != null) {
+                        try {
+                            processor.upscale(pageKey, translatedPage, upscaler, companionDir)
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                            throw cancelled
+                        } catch (t: Throwable) {
+                            if (translatedPage.coloredBitmap != null) {
+                                translatedPage.coloringStatus = StageStatus.FAILED
+                                translatedPage.coloringError = t.message ?: "Upscaling failed"
+                            } else {
+                                translatedPage.translationStatus = StageStatus.FAILED
+                                translatedPage.translationError = t.message ?: "Upscaling failed"
+                            }
+                        }
+                    }
+
+                    // Commit final bundle
+                    try {
+                        processor.handOffColoredBitmapForDisplay(translatedPage)
+                        store.updatePageFromCurrentSnapshot(pageKey, "batch:commit") { translatedPage }
+                    } finally {
+                        processor.releasePageBitmaps(translatedPage)
+                    }
+
+                    completedCount++
+                    publish(
+                        progress,
+                        Progress(
+                            chapterKey = chapterKey,
+                            completedPages = completedCount,
+                            totalPages = totalCount,
+                            currentStage = "INPAINTING",
+                        ),
+                        onProgress,
+                    )
+                }
+            }
+
+            translationTask.join()
+            inpaintingTask.join()
+        }
+
+        val finalProgress = Progress(chapterKey, totalCount, totalCount, "COMPLETED", isFinished = true)
+        publish(progress, finalProgress, onProgress)
+        return finalProgress
+    }
+
+    private fun publish(
+        progress: MutableStateFlow<Progress>,
+        value: Progress,
+        onProgress: ((Progress) -> Unit)?,
+    ) {
+        progress.value = value
+        onProgress?.invoke(value)
+    }
+}

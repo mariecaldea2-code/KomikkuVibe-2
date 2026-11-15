@@ -1,0 +1,540 @@
+package eu.kanade.translation.engines.vision.ocr
+
+import android.graphics.Bitmap
+import eu.kanade.translation.diagnostics.NativeVisionTelemetry
+import eu.kanade.translation.engines.vision.ocr.PaddleOcrV6DetEngine
+import eu.kanade.translation.engines.vision.ocr.PaddleOcrV6SmallEngine
+import eu.kanade.translation.engines.vision.ocr.paddle.batch.PaddleOcrBatch
+import eu.kanade.translation.engines.vision.ocr.paddle.batch.PaddleOcrBatchPlanner
+import eu.kanade.translation.engines.vision.ocr.paddle.batch.PaddleOcrBatchSize
+import eu.kanade.translation.engines.vision.ocr.paddle.batch.PaddleOcrCropOwnership
+import eu.kanade.translation.engines.vision.ocr.paddle.batch.PaddleOcrLeafIdentity
+import eu.kanade.translation.engines.vision.ocr.paddle.batch.PaddleOcrLeafWork
+import eu.kanade.translation.engines.vision.ocr.paddle.batch.PaddleOcrPageGeneration
+import eu.kanade.translation.engines.vision.ocr.paddle.batch.PaddleOcrParentRegion
+import eu.kanade.translation.engines.vision.ocr.paddle.batch.PaddleOcrWidthBucket
+import eu.kanade.translation.model.Detection
+import eu.kanade.translation.model.TextRecognizerLanguage
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import logcat.LogPriority
+import tachiyomi.core.common.util.system.logcat
+import java.util.concurrent.CancellationException
+import kotlin.math.ceil
+
+/** The page-level scheduling surface used by the three translation modes. */
+internal enum class PaddlePageOcrMode {
+    MANUAL,
+    AUTO,
+    CHAPTER,
+    ;
+
+    /** Lower values are admitted first when a caller has multiple page jobs. */
+    val priority: Int
+        get() = when (this) {
+            MANUAL -> 0
+            AUTO -> 1
+            CHAPTER -> 2
+        }
+}
+
+/**
+ * Batch sizing defaults to B1; the device gate can inject a larger
+ * size without changing page ownership or mapping. [dynamicCeiling] arms
+ * whole-page chunking; null (function or return) keeps fixed tier chunking.
+ */
+internal data class PaddlePageOcrPolicy(
+    val mode: PaddlePageOcrMode,
+    val validatedBatchSize: PaddleOcrBatchSize = PaddleOcrBatchSize.B1,
+    /**
+     * Whole-page dynamic chunking; null (function or return) keeps fixed tier
+     * chunking. The return is nullable so a caller can arm the seam before the
+     * dynamic policy exists (the engine passes a helper that returns null when
+     * fixed-tier batching is active).
+     */
+    val dynamicCeiling: ((bucket: PaddleOcrWidthBucket) -> Int?)? = null,
+)
+
+internal data class PaddlePageRegionResult(
+    val text: String,
+    val rotatedForOcr: Boolean,
+)
+
+/** One bounded, page-scoped recognizer call for diagnostics and tests. */
+internal data class PaddlePageBatchTrace(
+    val sequence: Long,
+    val pageGeneration: PaddleOcrPageGeneration,
+    val widthBucket: PaddleOcrWidthBucket,
+    val leafIdentities: List<PaddleOcrLeafIdentity>,
+    val requestedBatchSize: PaddleOcrBatchSize,
+    val requestedChunkSize: Int = requestedBatchSize.value,
+    val queueWaitMs: Double,
+    val admissionWaitMs: Double,
+    val batchLatencyMs: Double,
+)
+
+/**
+ * Generic page dispatcher. The planner stays single-thread-confined here; the
+ * shared mutex is the explicit seam guard for the engine session's one output
+ * buffer. It is intentionally independent of nativeGuard, which remains owned
+ * by RoiPageRecognitionEngine around the complete page.
+ */
+internal class PaddlePageOcrBatchDispatcher<CROP, RESULT>(
+    private val pageGeneration: PaddleOcrPageGeneration,
+    private val policy: PaddlePageOcrPolicy,
+    private val recognizeBatch: suspend (
+        crops: List<CROP>,
+        widthBucket: PaddleOcrWidthBucket,
+        maxBatch: Int,
+    ) -> List<RESULT>,
+    private val batchCallMutex: Mutex,
+    private val nowNanos: () -> Long = System::nanoTime,
+    private val traceSequence: () -> Long = { 0L },
+    private val executorLatencyMs: () -> Double? = { null },
+) {
+    private val planner = PaddleOcrBatchPlanner<CROP>(
+        pageGeneration,
+        policy.validatedBatchSize,
+        chunkSizeFor = { bucket ->
+            policy.dynamicCeiling?.invoke(bucket) ?: policy.validatedBatchSize.value
+        },
+    )
+    private val admittedAtNanos = LinkedHashMap<PaddleOcrLeafIdentity, Long>()
+    private val resultsByIdentity = LinkedHashMap<PaddleOcrLeafIdentity, RESULT>()
+    private val traces = ArrayList<PaddlePageBatchTrace>()
+
+    val results: Map<PaddleOcrLeafIdentity, RESULT>
+        get() = resultsByIdentity.toMap()
+
+    val batchTraces: List<PaddlePageBatchTrace>
+        get() = traces.toList()
+
+    val resolvedLeafCount: Int
+        get() = resultsByIdentity.size
+
+    suspend fun submit(leaf: PaddleOcrLeafWork<CROP>) {
+        val admittedAt = nowNanos()
+        admittedAtNanos[leaf.identity] = admittedAt
+        try {
+            planner.admit(leaf)?.let { batch -> execute(batch) }
+        } catch (failure: Throwable) {
+            if (!leaf.cropOwnership.isReleased) leaf.releaseCropOwnership()
+            admittedAtNanos.remove(leaf.identity)
+            throw failure
+        }
+    }
+
+    suspend fun finish() {
+        planner.finishPage().forEach { batch -> execute(batch) }
+        check(planner.isDrained) { "Paddle page planner did not drain $pageGeneration" }
+    }
+
+    fun cancel() {
+        planner.cancel()
+        admittedAtNanos.clear()
+    }
+
+    private suspend fun execute(batch: PaddleOcrBatch<CROP>) {
+        val firstAdmission = batch.leaves.minOfOrNull { admittedAtNanos[it.identity] ?: nowNanos() } ?: nowNanos()
+        val beforeMutex = nowNanos()
+        try {
+            val rows = batchCallMutex.withLock {
+                recognizeBatch(batch.leaves.map { it.crop }, batch.widthBucket, batch.leaves.size)
+            }
+            val afterMutex = nowNanos()
+            planner.complete(batch, rows) { leaf, result ->
+                check(resultsByIdentity.put(leaf.identity, result) == null) {
+                    "duplicate Paddle page result for ${leaf.identity}"
+                }
+                admittedAtNanos.remove(leaf.identity)
+            }
+            traces += PaddlePageBatchTrace(
+                sequence = traceSequence(),
+                pageGeneration = pageGeneration,
+                widthBucket = batch.widthBucket,
+                leafIdentities = batch.leaves.map { it.identity },
+                requestedBatchSize = policy.validatedBatchSize,
+                requestedChunkSize = batch.size,
+                queueWaitMs = nanosToMs(beforeMutex - firstAdmission),
+                admissionWaitMs = nanosToMs(afterMutex - beforeMutex),
+                batchLatencyMs = executorLatencyMs()?.takeIf { it.isFinite() && it >= 0.0 }
+                    ?: nanosToMs(afterMutex - beforeMutex),
+            )
+        } catch (cancelled: CancellationException) {
+            if (!batch.isComplete) planner.release(batch)
+            planner.cancel()
+            admittedAtNanos.clear()
+            throw cancelled
+        } catch (failure: Throwable) {
+            if (!batch.isComplete) planner.release(batch)
+            planner.cancel()
+            admittedAtNanos.clear()
+            throw failure
+        }
+    }
+
+    private fun nanosToMs(value: Long): Double = value.coerceAtLeast(0L) / 1_000_000.0
+}
+
+/**
+ * Adapts page detections and the existing Paddle geometry into final leaves,
+ * drains same-page buckets, and restores region text before the caller commits
+ * the PageTranslation. No durable state is touched here.
+ */
+internal class PaddlePageOcrCoordinator(
+    private val engine: PaddleOcrV6SmallEngine,
+    internal val validatedBatchSize: PaddleOcrBatchSize = PaddleOcrBatchSize.B1,
+    private val dynamicCeiling: ((bucket: PaddleOcrWidthBucket) -> Int?)? = null,
+    private val nowNanos: () -> Long = System::nanoTime,
+) {
+    /** One guard per engine session; no output-buffer downgrade is concurrency design. */
+    private val batchCallMutex = Mutex()
+    private var nextTraceSequence = 0L
+
+    @Volatile
+    var lastBatchTrace: List<PaddlePageBatchTrace> = emptyList()
+        private set
+
+    @Volatile
+    var lastResolvedLeafCount: Int = 0
+        private set
+
+    suspend fun recognizePage(
+        pageGeneration: PaddleOcrPageGeneration,
+        bitmap: Bitmap,
+        detections: List<Detection>,
+        paddleDet: PaddleOcrV6DetEngine?,
+        language: TextRecognizerLanguage,
+        isVerticalLanguage: Boolean,
+        mode: PaddlePageOcrMode,
+        isClosed: () -> Boolean,
+    ): List<PaddlePageRegionResult> {
+        val policy = PaddlePageOcrPolicy(mode, validatedBatchSize, dynamicCeiling)
+        val initialDispatcher = dispatcher(pageGeneration, policy)
+        val states = ArrayList<RegionState>(detections.size)
+        var fallbackDispatcher: PaddlePageOcrBatchDispatcher<Bitmap, Pair<String, Float>>? = null
+        val pageDetLines: List<TextLine> = if (paddleDet != null && detections.isNotEmpty()) {
+            try {
+                paddleDet.detectLines(bitmap)
+            } catch (e: Exception) {
+                logcat(LogPriority.WARN, e) {
+                    "[paddle_det] page-level detection failed; falling back to heuristic"
+                }
+                emptyList()
+            }
+        } else {
+            emptyList()
+        }
+        try {
+            detections.forEachIndexed { regionIndex, detection ->
+                check(!isClosed()) { "ONNX recognition engine closed during OCR geometry planning" }
+                val state = planInitialRegion(
+                    bitmap = bitmap,
+                    regionIndex = regionIndex,
+                    detection = detection,
+                    pageDetLines = pageDetLines,
+                    paddleDet = paddleDet,
+                    language = language,
+                    isVerticalLanguage = isVerticalLanguage,
+                    isClosed = isClosed,
+                )
+                submitPlan(
+                    pageGeneration = pageGeneration,
+                    regionIndex = regionIndex,
+                    phase = "initial",
+                    plan = state.initialPlan,
+                    dispatcher = initialDispatcher,
+                    isClosed = isClosed,
+                ).also { state.initialBoundPlan = it }
+                states += state
+            }
+            initialDispatcher.finish()
+            val initialLeafCount = states.sumOf { it.initialBoundPlan?.identities?.size ?: 0 }
+            check(initialDispatcher.resolvedLeafCount == initialLeafCount) {
+                "Paddle initial page leaves unresolved: expected=$initialLeafCount " +
+                    "resolved=${initialDispatcher.resolvedLeafCount} page=$pageGeneration"
+            }
+            val initialResults = initialDispatcher.results
+            states.forEach { state ->
+                state.text = compose(state.initialBoundPlan!!, initialResults, language)
+            }
+
+            val fallbackStates = states.filter { it.needsUnpaddedReread && it.text.isEmpty() }
+            if (fallbackStates.isNotEmpty()) {
+                fallbackDispatcher = dispatcher(pageGeneration, policy)
+                fallbackStates.forEach { state ->
+                    check(!isClosed()) { "ONNX recognition engine closed during Paddle fallback planning" }
+                    // Match the existing sequential path: entering the
+                    // unpadded reread marks the region as rotated even when
+                    // the fallback still produces an empty string.
+                    state.rotatedForOcr = true
+                    val unpadded = VerticalLineOcr.cropBitmap(
+                        bitmap,
+                        state.bbox[0],
+                        state.bbox[1],
+                        state.bbox[2],
+                        state.bbox[3],
+                    )
+                    val fallbackPlan = try {
+                        VerticalLineOcr.planMultiLine(
+                            crop = unpadded,
+                            paddleDet = null,
+                            verticalFallback = true,
+                            language = language,
+                            isClosed = isClosed,
+                        )
+                    } finally {
+                        unpadded.recycle()
+                    }
+                    val bound = submitPlan(
+                        pageGeneration = pageGeneration,
+                        regionIndex = state.regionIndex,
+                        phase = "unpad-reread",
+                        plan = fallbackPlan,
+                        dispatcher = fallbackDispatcher,
+                        isClosed = isClosed,
+                    )
+                    state.fallbackBoundPlan = bound
+                }
+                fallbackDispatcher.finish()
+                val fallbackLeafCount = fallbackStates.sumOf { it.fallbackBoundPlan?.identities?.size ?: 0 }
+                check(fallbackDispatcher.resolvedLeafCount == fallbackLeafCount) {
+                    "Paddle fallback page leaves unresolved: expected=$fallbackLeafCount " +
+                        "resolved=${fallbackDispatcher.resolvedLeafCount} page=$pageGeneration"
+                }
+                val fallbackResults = fallbackDispatcher.results
+                fallbackStates.forEach { state ->
+                    val fallbackText = compose(state.fallbackBoundPlan!!, fallbackResults, language)
+                    if (fallbackText.isNotEmpty()) {
+                        state.text = fallbackText
+                    }
+                }
+            }
+
+            val traces = initialDispatcher.batchTraces + (fallbackDispatcher?.batchTraces ?: emptyList())
+            lastBatchTrace = traces
+            val leafCount = initialDispatcher.resolvedLeafCount + (fallbackDispatcher?.resolvedLeafCount ?: 0)
+            lastResolvedLeafCount = leafCount
+
+            val totalInferMs = traces.sumOf { it.batchLatencyMs }
+            val avgInferMs = if (leafCount > 0) totalInferMs / leafCount else 0.0
+            NativeVisionTelemetry.logCropSummary(
+                pageKey = pageGeneration.pageId,
+                leafCount = leafCount,
+                // Dynamic chunks can exceed the tier; report the largest used.
+                batchSize = maxOf(validatedBatchSize.value, traces.maxOfOrNull { it.requestedChunkSize } ?: 0),
+                avgInferMs = avgInferMs,
+                provider = engine.executionProviderLabel,
+            )
+
+            return states.map { PaddlePageRegionResult(it.text, it.rotatedForOcr) }
+        } catch (failure: Throwable) {
+            initialDispatcher.cancel()
+            fallbackDispatcher?.cancel()
+            lastBatchTrace = emptyList()
+            lastResolvedLeafCount = 0
+            throw failure
+        }
+    }
+
+    private fun dispatcher(
+        pageGeneration: PaddleOcrPageGeneration,
+        policy: PaddlePageOcrPolicy,
+    ): PaddlePageOcrBatchDispatcher<Bitmap, Pair<String, Float>> = PaddlePageOcrBatchDispatcher(
+        pageGeneration = pageGeneration,
+        policy = policy,
+        batchCallMutex = batchCallMutex,
+        nowNanos = nowNanos,
+        executorLatencyMs = { engine.lastBatchTelemetry?.latencyMs },
+        traceSequence = {
+            nextTraceSequence++
+        },
+        recognizeBatch = { crops, widthBucket, maxBatch ->
+            if (maxBatch <= 1) {
+                crops.map { engine.recognizeWithConf(it) }
+            } else {
+                engine.recognizeBucketBatch(crops, widthBucket.paddedWidth, maxBatch)
+            }
+        },
+    )
+
+    private suspend fun planInitialRegion(
+        bitmap: Bitmap,
+        regionIndex: Int,
+        detection: Detection,
+        pageDetLines: List<TextLine>,
+        paddleDet: PaddleOcrV6DetEngine?,
+        language: TextRecognizerLanguage,
+        isVerticalLanguage: Boolean,
+        isClosed: () -> Boolean,
+    ): RegionState {
+        val bbox = detection.bbox
+        val pad = 12
+        val boxWidth = (bbox[2] - bbox[0]).toFloat()
+        val boxHeight = (bbox[3] - bbox[1]).toFloat()
+        val isVerticalBubble = isVerticalLanguage && (boxWidth <= boxHeight * 1.5f)
+
+        fun extractLinesForCrop(cropX0: Int, cropY0: Int, cropX1: Int, cropY1: Int): List<TextLine> {
+            if (pageDetLines.isEmpty()) return emptyList()
+            val cropW = (cropX1 - cropX0).coerceAtLeast(1)
+            val cropH = (cropY1 - cropY0).coerceAtLeast(1)
+            val matched = ArrayList<TextLine>()
+            for (line in pageDetLines) {
+                val lb = line.bbox
+                val centerX = (lb[0] + lb[2]) / 2
+                val centerY = (lb[1] + lb[3]) / 2
+                val inBounds = centerX in (bbox[0] - 4)..(bbox[2] + 4) && centerY in (bbox[1] - 4)..(bbox[3] + 4)
+                if (!inBounds) {
+                    val ix0 = maxOf(lb[0], bbox[0])
+                    val iy0 = maxOf(lb[1], bbox[1])
+                    val ix1 = minOf(lb[2], bbox[2])
+                    val iy1 = minOf(lb[3], bbox[3])
+                    val interArea = maxOf(0, ix1 - ix0) * maxOf(0, iy1 - iy0)
+                    val lineArea = (lb[2] - lb[0]) * (lb[3] - lb[1])
+                    if (lineArea <= 0 || interArea < lineArea * 0.4f) continue
+                }
+                val localX0 = (lb[0] - cropX0).coerceIn(0, cropW)
+                val localY0 = (lb[1] - cropY0).coerceIn(0, cropH)
+                val localX1 = (lb[2] - cropX0).coerceIn(0, cropW)
+                val localY1 = (lb[3] - cropY0).coerceIn(0, cropH)
+                if (localX1 > localX0 && localY1 > localY0) {
+                    matched.add(TextLine(intArrayOf(localX0, localY0, localX1, localY1), line.meanScore))
+                }
+            }
+            return matched
+        }
+
+        val plan = if (isVerticalBubble) {
+            val unpadded = VerticalLineOcr.cropBitmap(bitmap, bbox[0], bbox[1], bbox[2], bbox[3])
+            try {
+                val lines = extractLinesForCrop(bbox[0], bbox[1], bbox[2], bbox[3])
+                VerticalLineOcr.planMultiLine(
+                    crop = unpadded,
+                    paddleDet = if (lines.isEmpty()) null else paddleDet,
+                    verticalFallback = true,
+                    language = language,
+                    isClosed = isClosed,
+                    preDetectedLines = lines,
+                )
+            } finally {
+                unpadded.recycle()
+            }
+        } else {
+            val cropX0 = bbox[0] - pad
+            val cropY0 = bbox[1] - pad
+            val cropX1 = bbox[2] + pad
+            val cropY1 = bbox[3] + pad
+            val padded = VerticalLineOcr.cropBitmap(bitmap, cropX0, cropY0, cropX1, cropY1)
+            try {
+                val lines = extractLinesForCrop(cropX0, cropY0, cropX1, cropY1)
+                VerticalLineOcr.planMultiLine(
+                    crop = padded,
+                    paddleDet = if (lines.isEmpty()) null else paddleDet,
+                    verticalFallback = false,
+                    language = language,
+                    isClosed = isClosed,
+                    preDetectedLines = lines,
+                )
+            } finally {
+                padded.recycle()
+            }
+        }
+        return RegionState(
+            regionIndex = regionIndex,
+            bbox = bbox.copyOf(),
+            initialPlan = plan,
+            needsUnpaddedReread = false,
+            rotatedForOcr = isVerticalBubble,
+        )
+    }
+
+    private suspend fun submitPlan(
+        pageGeneration: PaddleOcrPageGeneration,
+        regionIndex: Int,
+        phase: String,
+        plan: PaddleVerticalRecognitionPlan,
+        dispatcher: PaddlePageOcrBatchDispatcher<Bitmap, Pair<String, Float>>,
+        isClosed: () -> Boolean,
+    ): BoundPlan {
+        val identities = ArrayList<PaddleOcrLeafIdentity>(plan.leaves.size)
+        var submitted = 0
+        try {
+            plan.leaves.forEachIndexed { leafIndex, planned ->
+                check(!isClosed()) { "ONNX recognition engine closed before Paddle leaf submission" }
+                val bucket = widthBucket(planned.crop)
+                val work = PaddleOcrLeafWork(
+                    pageGeneration = pageGeneration,
+                    parentRegion = PaddleOcrParentRegion(regionIndex),
+                    lineIndex = planned.lineIndex,
+                    glyphIndex = planned.glyphIndex,
+                    crop = planned.crop,
+                    cropOwnership = PaddleOcrCropOwnership(
+                        token = "${pageGeneration.pageId}:${pageGeneration.generation}:$regionIndex:$phase:$leafIndex",
+                        onRelease = { planned.crop.recycle() },
+                    ),
+                    rotation = planned.rotation,
+                    fallbackKind = planned.fallbackKind,
+                    widthBucket = bucket,
+                )
+                try {
+                    dispatcher.submit(work)
+                    identities += work.identity
+                    submitted++
+                } catch (failure: Throwable) {
+                    if (!work.cropOwnership.isReleased) work.releaseCropOwnership()
+                    submitted = leafIndex + 1
+                    throw failure
+                }
+            }
+        } catch (failure: Throwable) {
+            plan.leaves.drop(submitted).forEach { it.crop.recycle() }
+            throw failure
+        }
+        return BoundPlan(
+            identities = identities,
+            groups = plan.groups,
+            separator = plan.separator,
+            filterConfidence = plan.filterConfidence,
+        )
+    }
+
+    private fun compose(
+        plan: BoundPlan,
+        results: Map<PaddleOcrLeafIdentity, Pair<String, Float>>,
+        language: TextRecognizerLanguage,
+    ): String = plan.groups.map { group ->
+        group.mapNotNull { localIndex ->
+            val result = results[plan.identities[localIndex]]
+                ?: error("Paddle leaf result missing for ${plan.identities[localIndex]}")
+            VerticalLineOcr.filterRecognizedText(result.first, result.second, language, plan.filterConfidence)
+                .takeIf { it.isNotEmpty() }
+        }.joinToString(plan.separator)
+    }.filter { it.isNotEmpty() }.joinToString(plan.separator)
+
+    private fun widthBucket(crop: Bitmap): PaddleOcrWidthBucket {
+        val safeWidth = crop.width.coerceAtLeast(1)
+        val safeHeight = crop.height.coerceAtLeast(1)
+        val scaledWidth = ceil(safeWidth * (PaddleOcrV6SmallEngine.RECOGNITION_HEIGHT.toFloat() / safeHeight))
+            .toInt()
+            .coerceIn(1, PaddleOcrV6SmallEngine.MAX_RECOGNITION_WIDTH)
+        return PaddleOcrWidthBucket.forScaledWidth(scaledWidth)
+    }
+
+    private data class RegionState(
+        val regionIndex: Int,
+        val bbox: IntArray,
+        val initialPlan: PaddleVerticalRecognitionPlan,
+        val needsUnpaddedReread: Boolean,
+        var rotatedForOcr: Boolean,
+        var initialBoundPlan: BoundPlan? = null,
+        var fallbackBoundPlan: BoundPlan? = null,
+        var text: String = "",
+    )
+
+    private data class BoundPlan(
+        val identities: List<PaddleOcrLeafIdentity>,
+        val groups: List<List<Int>>,
+        val separator: String,
+        val filterConfidence: Boolean,
+    )
+}

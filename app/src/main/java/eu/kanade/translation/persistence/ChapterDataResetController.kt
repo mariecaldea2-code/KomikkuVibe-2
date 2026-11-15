@@ -1,0 +1,261 @@
+package eu.kanade.translation.persistence
+
+import com.hippo.unifile.UniFile
+import eu.kanade.tachiyomi.source.Source
+import eu.kanade.translation.coordinator.BatchTranslationCoordinator
+import eu.kanade.translation.persistence.ActiveChapterStoreRegistry
+import eu.kanade.translation.persistence.ChapterArtifactDeletionPlan
+import eu.kanade.translation.persistence.ChapterResetReceipt
+import eu.kanade.translation.persistence.ChapterTranslationStore
+import eu.kanade.translation.persistence.TranslationFileProvider
+import eu.kanade.translation.persistence.UniFileChapterDocumentIo
+import eu.kanade.translation.processing.execution.TranslationStreamRegistry
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import logcat.LogPriority
+import tachiyomi.core.common.util.system.logcat
+import tachiyomi.domain.chapter.model.Chapter
+import tachiyomi.domain.manga.model.Manga
+
+/**
+ * Owns chapter and page deletion/reset operations. Deletion first cancels and joins page and
+ * batch work, then defuncts the store, clears reader streams, and removes artifacts and
+ * companion images. The ordering is covered by [TranslationManagerDeleteResetOrderingTest].
+ */
+internal class ChapterDataResetController(
+    private val findTranslationDocumentFn: (
+        chapterName: String,
+        scanlator: String?,
+        mangaTitle: String,
+        source: Source,
+    ) -> TranslationDocument?,
+    private val cancelPageTranslationsFn: suspend (Long) -> Unit,
+    private val cancelPageTranslationFn: (Long, String) -> Boolean,
+    private val removeFromTranslationQueueFn: (Chapter) -> Unit,
+    private val translatorProvider: () -> BatchTranslationCoordinator,
+    private val disposeBatchTrackerFn: (Long) -> Unit,
+    private val unregisterActiveTranslationStoreFn: suspend (Long) -> Unit,
+    private val streamRegistryProvider: () -> TranslationStreamRegistry,
+    private val providerProvider: () -> TranslationFileProvider,
+    private val retireChapterCompanionImagesFn: (Manga, Chapter, Source) -> Int,
+    private val retirePageCompanionImageFn: (Manga, Chapter, Source, String, String, () -> Boolean) -> Unit,
+    private val durableStatusResolverProvider: () -> DurableChapterStatusResolver,
+    private val activeStoresProvider: () -> ActiveChapterStoreRegistry,
+    private val openExistingChapterTranslationStoreFn: suspend (
+        Long?,
+        String,
+        String?,
+        String,
+        Source,
+    ) -> ChapterTranslationStore?,
+    /** Injectable so tests can drive the deletion plan over an in-memory io tree. */
+    private val chapterIoFactory: (UniFile) -> ChapterDocumentIo = ::UniFileChapterDocumentIo,
+) {
+
+    // Resolve manager-owned dependencies at call time without retaining second owners.
+    private val translator get() = translatorProvider()
+
+    private val streamRegistry get() = streamRegistryProvider()
+
+    private val provider get() = providerProvider()
+
+    private val durableStatusResolver get() = durableStatusResolverProvider()
+
+    private val activeStores get() = activeStoresProvider()
+
+    private fun findTranslationDocument(
+        chapterName: String,
+        scanlator: String?,
+        mangaTitle: String,
+        source: Source,
+    ): TranslationDocument? = findTranslationDocumentFn(chapterName, scanlator, mangaTitle, source)
+
+    private suspend fun cancelPageTranslations(chapterId: Long) = cancelPageTranslationsFn(chapterId)
+
+    private fun cancelPageTranslation(chapterId: Long, pageKey: String): Boolean =
+        cancelPageTranslationFn(chapterId, pageKey)
+
+    private fun removeFromTranslationQueue(chapter: Chapter) = removeFromTranslationQueueFn(chapter)
+
+    private fun disposeBatchTracker(chapterId: Long) = disposeBatchTrackerFn(chapterId)
+
+    private suspend fun unregisterActiveTranslationStore(chapterId: Long) = unregisterActiveTranslationStoreFn(chapterId)
+
+    private fun retireChapterCompanionImages(manga: Manga, chapter: Chapter, source: Source) =
+        retireChapterCompanionImagesFn(manga, chapter, source)
+
+    private fun retirePageCompanionImage(
+        manga: Manga,
+        chapter: Chapter,
+        source: Source,
+        pageKey: String,
+        imageName: String,
+        isReferencedElsewhere: () -> Boolean,
+    ) = retirePageCompanionImageFn(manga, chapter, source, pageKey, imageName, isReferencedElsewhere)
+
+    private suspend fun openExistingChapterTranslationStore(
+        chapterId: Long?,
+        chapterName: String,
+        scanlator: String?,
+        mangaTitle: String,
+        source: Source,
+    ): ChapterTranslationStore? = openExistingChapterTranslationStoreFn(chapterId, chapterName, scanlator, mangaTitle, source)
+
+    suspend fun deleteTranslation(chapter: Chapter, manga: Manga, source: Source): ChapterResetReceipt {
+        val chapterId = chapter.id ?: return ChapterResetReceipt.COMPLETE
+        // Capture the current artifact authority before teardown can evict the
+        // only store that still knows the chapter's artifact names.
+        // This is read-only and runs off the caller thread because SAF reads can
+        // block; the cancellation ordering below remains unchanged.
+        val deletionDocument = withContext(Dispatchers.IO) {
+            findTranslationDocument(chapter.name, chapter.scanlator, manga.title, source)
+        }
+        val artifactDeletionPlan = deletionDocument?.let { document ->
+            withContext(Dispatchers.IO) {
+                ChapterArtifactDeletionPlan.capture(
+                    chapterIoFactory(document.parent),
+                    document.fileName,
+                )
+            }
+        }
+        // SYNCHRONOUS teardown (was fire-and-forget): a delete-then-retranslate let the reader
+        // re-bind to the about-to-be-evicted store while the translator wrote to a fresh instance,
+        // and a cancelled-but-not-joined batch worker kept writing into the old store after its
+        // file/PNGs were deleted (recreating the JSON or stranding pages at RUNNING). Suspending
+        // guarantees callers land on clean state.
+        //
+        // Ordering is load-bearing and strictly sequenced:
+        //   1. cancelPageTranslations invalidates the reader session and joins page work before the store is touched.
+        //   2. removeFromTranslationQueue + cancelTranslatorJobAndJoin drop the batch entry and JOIN the
+        //      batch worker (plain removeFrom only cancel()s) so it releases the translator permit before deletion.
+        //   4. unregisterActiveTranslationStore marks the store defunct so a still-unwinding worker's late writes no-op.
+        //   5. streamRegistry.clearChapter drops stale reader closures pointing at the about-to-be-deleted PNGs.
+        //   6. Only once all work is wound down is it safe to delete the artifact tree and companion images.
+        cancelPageTranslations(chapterId)
+        removeFromTranslationQueue(chapter)
+        translator.cancelTranslatorJobAndJoin()
+        disposeBatchTracker(chapterId)
+        withContext(Dispatchers.IO) {
+            unregisterActiveTranslationStore(chapterId)
+        }
+        streamRegistry.clearChapter(source.id, manga.id, chapterId)
+        val failures = mutableListOf<String>()
+        var authorityRemoved = true
+        var removedFiles = 0
+        var removedDirs = 0
+        artifactDeletionPlan?.let { plan ->
+            val result = withContext(Dispatchers.IO) { plan.delete() }
+            authorityRemoved = result.manifestRemoved
+            removedFiles += result.removedFiles
+            removedDirs += result.removedDirs
+            if (result.destructiveCheckpointUnverified) {
+                failures += "destructive checkpoint unverified: chapter=${chapter.name}"
+            }
+            failures.addAll(result.failures.map { "artifact deletion failed: $it" })
+            logcat(if (result.complete) LogPriority.INFO else LogPriority.ERROR) {
+                "TachiyomiAT chapter artifact deletion: chapter=${chapter.name} " +
+                    "manifestRemoved=${result.manifestRemoved} " +
+                    "artifactTreeRemoved=${result.artifactTreeRemoved} " +
+                    "checkpointUnverified=${result.destructiveCheckpointUnverified} " +
+                    "failures=${result.failures.size}"
+            }
+            // Legacy flat files are deliberately retained; deletion only owns manifest artifacts.
+        }
+        if (authorityRemoved) removedFiles += retireChapterCompanionImages(manga, chapter, source)
+        durableStatusResolver.clearDurableStatusCache()
+        return ChapterResetReceipt.incomplete(failures, removedFiles, removedDirs)
+    }
+
+    suspend fun resetOcrData(chapter: Chapter, manga: Manga, source: Source, pageKey: String): ChapterResetReceipt {
+        val chapterId = chapter.id ?: return ChapterResetReceipt.COMPLETE
+        durableStatusResolver.clearDurableStatusCache()
+
+        cancelPageTranslation(chapterId, pageKey)
+        streamRegistry.clearPage(source.id, manga.id, chapterId, pageKey)
+        val failures = mutableListOf<String>()
+
+        var ownershipStore = activeStores.get(chapterId)
+        val activeStore = ownershipStore
+        val persisted = activeStore?.state?.value?.get(pageKey)
+        val persistedCleanedName = persisted?.cleanedImageName
+        val persistedColoredName = persisted?.coloredImageName
+        if (activeStore != null) {
+            activeStore.deletePage(pageKey)?.let { failures += it }
+            activeStore.flush()
+        } else {
+            openExistingChapterTranslationStore(
+                chapterId,
+                chapter.name,
+                chapter.scanlator,
+                manga.title,
+                source,
+            )?.let { store ->
+                ownershipStore = store
+                store.deletePage(pageKey)?.let { failures += it }
+                store.flush()
+            }
+        }
+
+        retirePageCompanionImages(
+            chapter,
+            manga,
+            source,
+            pageKey,
+            persistedCleanedName,
+            persistedColoredName,
+            ownershipStore,
+        )
+        return ChapterResetReceipt.incomplete(failures)
+    }
+
+    /**
+     * Retires the page's cleaned and colored companion images unless another page still
+     * references them; deletePage has already dropped this page's references, so the
+     * guard only needs the other-page check, routed by the name's intrinsic domain.
+     */
+    private fun retirePageCompanionImages(
+        chapter: Chapter,
+        manga: Manga,
+        source: Source,
+        pageKey: String,
+        persistedCleanedName: String?,
+        persistedColoredName: String?,
+        ownershipStore: ChapterTranslationStore?,
+    ) {
+        val safePageKey = pageKey.substringAfterLast('/').replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        val retiredNames = buildSet {
+            persistedCleanedName?.let(::add)
+            persistedColoredName?.let(::add)
+            add("$safePageKey.cleaned.png")
+            add("$safePageKey.cleaned.jpg")
+            add("$safePageKey.rendered.png")
+            // Versioned publication names are unique per replacement attempt;
+            // remove any orphaned versions left after a deleted store entry.
+            provider.findCompanionImageDir(manga.title, source, chapter.name, chapter.scanlator)
+                ?.listFiles()
+                ?.asSequence()
+                .orEmpty()
+                .mapNotNull { it.name }
+                .filter { it.startsWith("$safePageKey.cleaned.") || it.startsWith("$safePageKey.colored.") }
+                .forEach(::add)
+        }
+        retiredNames.forEach { imageName ->
+            retirePageCompanionImage(manga, chapter, source, pageKey, imageName) {
+                if (imageName.contains(".colored.")) {
+                    ownershipStore?.let { !it.mayDeleteColoredImage(pageKey, imageName) } ?: false
+                } else {
+                    ownershipStore?.isCleanedImageReferencedByAnotherPage(pageKey, imageName) == true
+                }
+            }
+        }
+    }
+
+    private suspend fun reconcileBatchProgress(chapterId: Long) {
+        // Refresh the active-store summary after a stage reset so the chapter
+        // list can drop stale progress data. Only runs when the store is open
+        // (i.e. the reader is active for this chapter); persisted-only chapters
+        // are unaffected because their summary is rebuilt on the next open.
+        val store = activeStores.get(chapterId) ?: return
+        store.flush()
+    }
+}

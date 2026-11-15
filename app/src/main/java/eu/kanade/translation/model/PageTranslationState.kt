@@ -1,0 +1,240 @@
+package eu.kanade.translation.model
+
+enum class PageStage {
+    Ocr,
+    Translation,
+    Inpaint,
+
+    // Retained so persisted legacy page leases can still be decoded.
+    Render,
+}
+
+sealed interface PageLifecycle {
+    data object Pending : PageLifecycle
+    data class Running(val stage: PageStage) : PageLifecycle
+    data object NeedsDisplay : PageLifecycle
+    data object Done : PageLifecycle
+    data object Textless : PageLifecycle
+    data object Cancelled : PageLifecycle
+    data class Failed(val stage: PageStage, val retryCount: Int, val reason: String?) : PageLifecycle
+}
+
+val PageTranslationView.displayImageName: String?
+    get() = displayImageName(colorizationEnabled = false)
+
+/**
+ * Pref-gated reader base image: a published colored image replaces the
+ * cleaned base only while colorization is enabled AND its inputs are still
+ * current (the colored image is derived from the cleaned one, so a stale or
+ * failed inpaint invalidates it). Disabling the pref reverts to the cleaned
+ * image without deleting anything. A colorize-only page has no cleaned input:
+ * its colored image stands on [coloredFromOriginal] alone.
+ */
+fun PageTranslationView.displayImageName(colorizationEnabled: Boolean): String? =
+    when {
+        colorizationEnabled &&
+            coloredImageName != null &&
+            coloringStatus == StageStatus.READY &&
+            (isCleanedImageReady || coloredFromOriginal) -> coloredImageName
+        else -> cleanedImageName?.takeIf { isTranslationDisplayReady }
+    }
+
+val PageTranslationView.hasCurrentInpaintResult: Boolean
+    get() = blocks.isEmpty() || inpaintRevision >= PageTranslation.CURRENT_INPAINT_REVISION
+
+/**
+ * The cleaned bitmap is safe to show only after the inpaint stage has published
+ * a current-revision file. A filename in the translation store is metadata, not
+ * proof that the reader can safely open the file.
+ */
+val PageTranslationView.isCleanedImageReady: Boolean
+    get() = cleanedImageName != null &&
+        inpaintStatus == StageStatus.READY &&
+        hasCurrentInpaintResult
+
+/**
+ * Single display-readiness predicate for translated text. Pager and webtoon
+ * must use this gate so a late translation/store emission can never draw text
+ * over the original image while inpaint is still pending or failed.
+ */
+val PageTranslationView.isTranslationDisplayReady: Boolean
+    get() = toPageDisplayProjection().displayReady
+
+val PageTranslationView.shouldShowTranslationOverlay: Boolean
+    get() = blocks.any { it.translation.isNotBlank() }
+
+/**
+ * true when this page carries a persisted inpaint mask captured by
+ * the current OCR logic, so a resumed batch can safely skip re-OCR and still
+ * erase detector-only + watermark regions.
+ *
+ * Signal: [PageTranslation.inpaintMaskBoxes] is a new persisted field whose
+ * default is the empty list, so any page OCR'd before this field existed (or
+ * whose OCR was skipped under the old resume gate) deserializes with an empty
+ * mask and is re-OCR'd to capture a complete one. A page OCR'd by current code
+ * always has a non-empty mask (unless it is genuinely textless).
+ *
+ * A textless page (empty blocks) is considered to have a current mask by
+ * definition — it has nothing to erase — so the stage-1 resume gate treats it
+ * as done instead of re-OCR'ing it forever.
+ *
+ * This is INDEPENDENT of [hasCurrentInpaintResult], which tracks whether the
+ * inpaint OUTPUT (cleaned image) matches the current revision. A page can have
+ * a current mask but a stale cleaned image (OCR'd, interrupted before inpaint)
+ * — that page skips re-OCR but still runs inpaint.
+ */
+val PageTranslationView.hasCurrentInpaintMask: Boolean
+    get() = blocks.isEmpty() || inpaintMaskBoxes.isNotEmpty()
+
+val PageTranslationView.hasRenderedResult: Boolean
+    get() = isTranslationDisplayReady
+
+val PageTranslationView.isStageRunning: Boolean
+    get() = ocrStatus == StageStatus.RUNNING ||
+        translationStatus == StageStatus.RUNNING ||
+        inpaintStatus == StageStatus.RUNNING ||
+        coloringStatus == StageStatus.RUNNING
+
+val PageTranslationView.isStageCancelled: Boolean
+    get() = ocrStatus == StageStatus.CANCELLED ||
+        translationStatus == StageStatus.CANCELLED ||
+        inpaintStatus == StageStatus.CANCELLED
+
+val PageTranslationView.isStageFailed: Boolean
+    get() = ocrStatus == StageStatus.FAILED ||
+        translationStatus == StageStatus.FAILED ||
+        inpaintStatus == StageStatus.FAILED
+
+/**
+ * Flip every non-terminal RUNNING/PENDING stage to CANCELLED in place, used to
+ * clear a page stranded in-flight after a cancellation (chapter switch, reader
+ * exit, per-page cancel). Centralises the per-stage rewrite used by the
+ * scheduler's cancellation paths.
+ * A cancel is NOT a failure, so retryCount is left untouched.
+ */
+fun PageTranslation.cancelInFlightStages() {
+    apply {
+        if (ocrStatus == StageStatus.RUNNING || ocrStatus == StageStatus.PENDING) ocrStatus = StageStatus.CANCELLED
+        if (translationStatus == StageStatus.RUNNING) translationStatus = StageStatus.CANCELLED
+        if (inpaintStatus == StageStatus.RUNNING) inpaintStatus = StageStatus.CANCELLED
+        if (coloringStatus == StageStatus.RUNNING) coloringStatus = StageStatus.CANCELLED
+    }
+}
+
+fun PageTranslation.prepareForcedRetry() {
+    retryCount = 0
+    attemptCount = 0
+    attemptCharged = false
+    ocrStatus = StageStatus.RUNNING
+    translationStatus = StageStatus.PENDING
+    inpaintStatus = StageStatus.PENDING
+    renderStatus = StageStatus.PENDING
+    coloringStatus = StageStatus.PENDING
+    errorMessage = null
+    cleanedImageName = null
+    cleanedImageContentHash = null
+    coloredImageName = null
+    coloredImageContentHash = null
+    coloringStamp = null
+    coloringFingerprint = null
+    coloredBitmap = null
+    originalImageFallback = false
+}
+
+/**
+ * record that this page-translation attempt ended in a terminal
+ * failure. Increments [PageTranslation.attemptCount] AT MOST ONCE per attempt.
+ * Translation failures own this charge; display/inpaint failures do not consume
+ * the translation retry budget.
+ *
+ * Idempotency is tracked via the [PageTranslation.attemptCharged] flag (set the
+ * first time this charges the attempt, reset by [prepareForcedRetry] or
+ * [resetAttemptCharge]). Callers set their own
+ * stage status to FAILED before OR after calling this — the guard does NOT
+ * inspect stage status, because the stage is typically already FAILED by the
+ * time this runs (so an `isStageFailed` guard would always no-op, which was a
+ * bug in the first version of this helper). This helper owns ONLY the
+ * exhaustion counter + the diagnostic [PageTranslation.retryCount].
+ *
+ * Pure (no Android/ONNX/Bitmap dependency) — unit-tested in
+ * [PageTranslationStateTest].
+ */
+fun PageTranslation.recordAttemptFailure() {
+    if (attemptCharged) return
+    attemptCharged = true
+    attemptCount++
+    retryCount++
+}
+
+/**
+ * Clears the page-local "charged" flag so a subsequent attempt can be counted
+ * by a caller that uses this compatibility counter.
+ */
+fun PageTranslation.resetAttemptCharge() {
+    attemptCharged = false
+}
+
+val PageTranslationView.isTextlessTerminal: Boolean
+    get() = ocrStatus == StageStatus.READY &&
+        blocks.isEmpty() &&
+        translationStatus == StageStatus.SKIPPED &&
+        (inpaintStatus == StageStatus.SKIPPED || inpaintStatus == StageStatus.READY)
+
+/**
+ * A colorize-only run finished this page: OCR/translation/inpaint were
+ * deliberately skipped and the colored image was published from the ORIGINAL
+ * page. Terminal the same way [isTextlessTerminal] is — no further pipeline
+ * work is expected unless a full translation is explicitly requested.
+ */
+val PageTranslationView.isColorizeOnlyComplete: Boolean
+    get() = coloredFromOriginal &&
+        coloredImageName != null &&
+        coloringStatus == StageStatus.READY &&
+        ocrStatus == StageStatus.SKIPPED &&
+        translationStatus == StageStatus.SKIPPED
+
+val PageTranslationView.hasRecognizedTranslation: Boolean
+    get() = ocrStatus == StageStatus.READY &&
+        (translationStatus == StageStatus.READY || translationStatus == StageStatus.PARTIAL) &&
+        blocks.isNotEmpty()
+
+val PageTranslationView.hasExhaustedRetries: Boolean
+    get() = isStageFailed && attemptCount >= StageStatus.MAX_STAGE_RETRIES
+
+val PageTranslationView.lifecycle: PageLifecycle
+    get() = when {
+        hasRenderedResult -> PageLifecycle.Done
+        isTextlessTerminal -> PageLifecycle.Textless
+        isStageCancelled -> PageLifecycle.Cancelled
+        inpaintStatus == StageStatus.FAILED -> PageLifecycle.Failed(PageStage.Inpaint, retryCount, errorMessage)
+        translationStatus == StageStatus.FAILED -> PageLifecycle.Failed(PageStage.Translation, retryCount, errorMessage)
+        ocrStatus == StageStatus.FAILED -> PageLifecycle.Failed(PageStage.Ocr, retryCount, errorMessage)
+        inpaintStatus == StageStatus.RUNNING -> PageLifecycle.Running(PageStage.Inpaint)
+        translationStatus == StageStatus.RUNNING -> PageLifecycle.Running(PageStage.Translation)
+        ocrStatus == StageStatus.RUNNING -> PageLifecycle.Running(PageStage.Ocr)
+        hasRecognizedTranslation -> PageLifecycle.NeedsDisplay
+        else -> PageLifecycle.Pending
+    }
+
+/**
+ * true when this page's [errorMessage] should be shown as a red
+ * error in the reader overlay.
+ *
+ * The view holders previously surfaced ANY non-null `errorMessage` once the
+ * page was idle — but cancellation, the stranded-page sweep, and textless
+ * terminal pages all write an explanatory `errorMessage` ("Translation
+ * cancelled", "Page was stranded mid-translation...", PARTIAL's "N/M blocks
+ * translated"). Those are NOT failures and must not be painted red over a
+ * page that produced output or was deliberately stopped.
+ *
+ * Rule: the error surfaces only when the page reached a genuine terminal
+ * [PageLifecycle.Failed] state (an OCR, translation, or inpaint stage FAILED, no cleaned result to
+ * show instead). PARTIAL, Textless, Cancelled, Done, and any in-flight state
+ * all suppress the error — the user sees either the translated image or
+ * nothing, never a stale/misleading red message.
+ */
+val PageTranslationView.shouldSurfaceError: Boolean
+    get() = !isCleanedImageReady &&
+        !isTextlessTerminal &&
+        !isStageCancelled &&
+        isStageFailed

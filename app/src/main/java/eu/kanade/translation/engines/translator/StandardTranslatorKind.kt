@@ -1,0 +1,68 @@
+package eu.kanade.translation.engines.translator
+import eu.kanade.translation.engines.translator.fumeto.FumetoTranslateEngine
+import eu.kanade.translation.engines.translator.providers.DeepLTranslator
+import eu.kanade.translation.engines.translator.providers.GoogleTranslator
+import eu.kanade.translation.engines.translator.providers.MLKitTranslator
+import eu.kanade.translation.model.TextRecognizerLanguage
+import eu.kanade.translation.model.TextTranslatorLanguage
+import tachiyomi.core.common.preference.Preference
+import tachiyomi.domain.translation.StandardEngine
+import tachiyomi.domain.translation.TranslationPreferences
+
+/**
+ * Built-in translators that do not use dynamic LLM model selection. Most require
+ * neither API keys nor model ids (Google Translate, on-device ML Kit); DeepL needs
+ * an API key and FumetoTranslate runs a bundled on-device model (ja→en only).
+ */
+enum class StandardTranslatorKind(val label: String) {
+    MLKIT("MlKit (On Device)"),
+    GOOGLE("Google Translate"),
+    DEEPL("DeepL"),
+    FUMETO("FumetoTranslate (On Device)"),
+    ;
+
+    fun build(
+        pref: TranslationPreferences,
+        fromLang: TextRecognizerLanguage,
+        toLang: TextTranslatorLanguage,
+    ): TextTranslator = when (this) {
+        MLKIT -> MLKitTranslator(fromLang, toLang)
+        GOOGLE -> GoogleTranslator(fromLang, toLang)
+        DEEPL -> {
+            // Fail fast on a missing key. Under the strict no-fallback policy this surfaces as a
+            // FAILED page so the user configures the key instead of silently getting the wrong engine.
+            val apiKey = pref.translationDeeplApiKey().get()
+            require(apiKey.isNotBlank()) { "DeepL API key is required" }
+            DeepLTranslator(fromLang, toLang, apiKey)
+        }
+        FUMETO -> {
+            // The bundled model is Japanese→English only; fail fast so a mismatched
+            // selection surfaces as a FAILED page instead of garbage output.
+            require(fromLang == TextRecognizerLanguage.JAPANESE) {
+                "FumetoTranslate requires Japanese as the source language"
+            }
+            require(toLang == TextTranslatorLanguage.ENGLISH) {
+                "FumetoTranslate requires English as the target language"
+            }
+            FumetoTranslateEngine()
+        }
+    }
+
+    companion object {
+        /**
+         * STRICT no-fallback. The old code silently returned MLKIT for an unknown stored
+         * engine — a corrupted/migrated pref quietly ran on-device ML Kit instead of the configured engine.
+         * Now an invalid value throws and the pipeline surfaces it as a FAILED page so the user fixes the setting.
+         */
+        fun fromPref(pref: Preference<StandardEngine>): StandardTranslatorKind {
+            val engine = pref.get()
+            val translator = entries.firstOrNull { it.name == engine.name }
+            if (translator == null) {
+                throw IllegalArgumentException(
+                    "Unknown translator engine '${engine.name}'. Reconfigure translation settings.",
+                )
+            }
+            return translator
+        }
+    }
+}
